@@ -1,0 +1,116 @@
+# sources.yaml: Apify living-reference source map
+# method vocab: llms.txt | md-suffix | store-api | statuspage-json | rss | github-api | context7 | scrape
+tool: Apify
+last_verified: 2026-07-02
+
+change_detector:
+  type: openapi_version
+  url: https://docs.apify.com/api/openapi.json
+  field: info.version
+  last_value: v2-2026-07-01T115402Z
+  note: info.version is a timestamp; diff the string to detect any API-surface change.
+
+sources:
+  - name: docs-index
+    url: https://docs.apify.com/llms.txt
+    method: llms.txt
+    last_fetched: 2026-07-02
+    ttl_days: 30
+    status: ok
+    note: LLM doc index; full twin llms-full.txt (~43MB): do NOT load whole.
+
+  - name: docs-md-twin
+    url: https://docs.apify.com/api.md
+    method: md-suffix
+    last_fetched: 2026-07-02
+    ttl_days: 30
+    status: ok
+    note: Every doc page has a .md twin (append .md to the page URL).
+
+  - name: openapi-spec
+    url: https://docs.apify.com/api/openapi.json
+    method: scrape
+    last_fetched: 2026-07-02
+    ttl_days: 30
+    status: ok
+    note: Global API OpenAPI; info.version = change detector (v2-2026-07-01T115402Z).
+
+  - name: per-actor-openapi
+    url: https://api.apify.com/v2/acts/apify~website-content-crawler/builds/default/openapi.json
+    method: scrape
+    last_fetched: 2026-07-02
+    ttl_days: 30
+    status: ok
+    note: Per-actor input/endpoint schema; substitute any username~name.
+
+  - name: store-catalog
+    url: https://api.apify.com/v2/store?limit=1&offset=0
+    method: store-api
+    last_fetched: 2026-07-02
+    ttl_days: 30
+    status: ok
+    note: Unauthenticated, paginated. data.total = 34498 (2026-07-02). Category enum + sortBy popularity|newest|relevance|lastEdit.
+
+  - name: pricing
+    url: https://apify.com/pricing.md
+    method: md-suffix
+    last_fetched: 2026-07-02
+    ttl_days: 30
+    status: ok
+    note: Plans Free $0 / Starter $29 / Scale $199 / Business $999 mo; CU $0.13-0.20; usage prepaid, no rollover.
+
+  - name: blog-rss
+    url: https://blog.apify.com/rss/
+    method: rss
+    last_fetched: 2026-07-02
+    ttl_days: 7
+    status: ok
+    note: Release/announcement posts. The product changelog itself is HTML-only.
+
+  - name: changelog-html
+    url: https://apify.com/change-log
+    method: scrape
+    last_fetched: 2026-07-02
+    ttl_days: 7
+    status: ok
+    note: HTML only: no RSS/JSON. Scrape or rely on openapi info.version detector.
+
+  - name: status-json
+    url: https://status.apify.com/api/v2/status.json
+    method: statuspage-json
+    last_fetched: 2026-07-02
+    ttl_days: 1
+    status: ok
+    note: status.indicator = none ("All Systems Operational") at 2026-07-02. summary.json for component detail.
+
+  - name: github-org
+    url: https://github.com/apify
+    method: github-api
+    last_fetched: 2026-07-02
+    ttl_days: 180
+    status: ok
+    note: apify-sdk-js/python, apify-cli, apify-client-js/python, crawlee, crawlee-python.
+
+  - name: mcp-server
+    url: https://mcp.apify.com
+    method: scrape
+    last_fetched: 2026-07-02
+    ttl_days: 180
+    status: auth-walled
+    note: First-party MCP tool surface; requires Authorization Bearer <api-token>.
+
+  - name: agi-agentic-payments
+    url: https://agi.apify.com
+    method: scrape
+    last_fetched: 2026-07-02
+    ttl_days: 180
+    status: ok
+    note: Agent General Interface; pay per-call via x402 / MPP without account.
+
+  - name: overview-landing
+    url: https://apify.com
+    method: scrape
+    last_fetched: 2026-07-02
+    ttl_days: 180
+    status: ok
+    note: Product overview / positioning.

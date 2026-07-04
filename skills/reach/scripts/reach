@@ -1,0 +1,216 @@
+#!/usr/bin/env bash
+# reach | a thin, server-less internet-fetch router.
+# Direct HTTP APIs + already-installed CLIs. No MCP servers, no daemons, no RAM footprint.
+# Keys (optional) live in ~/.reach/keys.env (gitignored): EXA_API_KEY, JINA_API_KEY.
+# Social platforms (Reddit/X/IG/FB) are NOT here on purpose | use `agent-reach` for those.
+set -uo pipefail
+
+KEYS="${REACH_KEYS:-$HOME/.reach/keys.env}"
+[ -f "$KEYS" ] && { set -a; . "$KEYS"; set +a; }
+UA="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) reach/1.0"
+
+_norm() { case "$1" in http://*|https://*) printf '%s' "$1" ;; *) printf 'https://%s' "$1" ;; esac; }
+
+_jina() { # clean markdown of any URL (server-side JS render), keyless; key raises rate limit
+  local url; url="$(_norm "$1")"
+  local h=(-H "User-Agent: $UA")
+  [ -n "${JINA_API_KEY:-}" ] && h+=(-H "Authorization: Bearer $JINA_API_KEY")
+  curl -s --max-time 45 "${h[@]}" "https://r.jina.ai/$url"
+}
+
+# --- cookie-social routing: reach is the single front door; these delegate to agent-reach ---
+_ar_backend() { command -v agent-reach >/dev/null && agent-reach doctor --json 2>/dev/null | jq -r --arg p "$1" '.[$p].active_backend // "none"' || echo none; }
+_need_social() { # $1=platform  $2=setup hint
+  echo "reach: '$1' is cookie-gated deep social, routed to agent-reach (needs a burner Chrome profile + login)." >&2
+  echo "       not configured yet. enable with: $2" >&2
+  echo "       then check: agent-reach doctor --json | jq .$1" >&2
+  exit 4
+}
+
+cmd="${1:-help}"; shift 2>/dev/null || true
+
+case "$cmd" in
+  web) # reach web <url>   (Jina -> Firecrawl -> curl+pandoc)
+    [ $# -ge 1 ] || { echo "usage: reach web <url>" >&2; exit 2; }
+    out="$(_jina "$1")"
+    if [ -n "$out" ] && ! printf '%s' "$out" | head -c 400 | grep -qiE 'rate limit|too many requests|"code":[0-9]|error 4[0-9][0-9]'; then
+      printf '%s\n' "$out"
+    else
+      echo "reach: jina failed, falling back to firecrawl (1 credit)" >&2
+      fc="$(firecrawl scrape "$(_norm "$1")" -f markdown 2>/dev/null | grep -v '^Scrape ID:')"
+      if [ -n "$fc" ]; then printf '%s\n' "$fc"
+      else
+        echo "reach: firecrawl failed too, raw curl+pandoc (no JS render)" >&2
+        curl -s --max-time 25 -A "$UA" "$(_norm "$1")" | pandoc -f html -t gfm-raw_html --wrap=none 2>/dev/null
+      fi
+    fi ;;
+
+  repo-wiki) # reach repo-wiki <org/repo>  (DeepWiki via Jina, keyless)
+    [ $# -ge 1 ] || { echo "usage: reach repo-wiki <org/repo>" >&2; exit 2; }
+    _jina "https://deepwiki.com/$1" ;;
+
+  search) # reach search <query...>   (Exa -> Jina search fallback)
+    q="$*"
+    [ -n "$q" ] || { echo "usage: reach search <query>" >&2; exit 2; }
+    if [ -n "${EXA_API_KEY:-}" ]; then
+      res="$(curl -s --max-time 30 -X POST "https://api.exa.ai/search" \
+        -H "x-api-key: $EXA_API_KEY" -H "Content-Type: application/json" \
+        -d "$(jq -n --arg q "$q" '{query:$q, numResults:8, type:"auto", contents:{text:{maxCharacters:500}}}')" \
+        | jq -r 'if .results then .results[] | "- \(.title)\n  \(.url)\n  \((.text // "") | gsub("\\s+";" ") | .[0:220])" else empty end')"
+      if [ -n "$res" ]; then printf '%s\n' "$res"; exit 0; fi
+      echo "reach: exa returned nothing, falling back to Jina search" >&2
+    else
+      echo "reach: no EXA_API_KEY, using Jina search" >&2
+    fi
+    h=(-H "User-Agent: $UA" -H "Accept: text/plain" -H "X-Respond-With: no-content")
+    [ -n "${JINA_API_KEY:-}" ] && h+=(-H "Authorization: Bearer $JINA_API_KEY")
+    curl -s --max-time 30 "${h[@]}" "https://s.jina.ai/$(printf '%s' "$q" | jq -sRr @uri)" | sed -n '1,60p' ;;
+
+  yt) # reach yt <url>   (metadata + auto transcript via yt-dlp, keyless)
+    [ $# -ge 1 ] || { echo "usage: reach yt <url>" >&2; exit 2; }
+    echo "## $(yt-dlp -q --no-warnings --print '%(title)s | %(channel)s | %(upload_date)s | %(duration_string)s | %(view_count)s views' "$1" 2>/dev/null)"
+    tmp="$(mktemp -d)"
+    yt-dlp -q --no-warnings --skip-download --write-auto-subs --write-subs \
+           --sub-lang "en.*" --sub-format vtt -o "$tmp/%(id)s.%(ext)s" "$1" 2>/dev/null
+    f="$(ls "$tmp"/*.vtt 2>/dev/null | head -1)"
+    if [ -n "$f" ]; then
+      echo "### transcript"
+      grep -vE '^(WEBVTT|Kind:|Language:|NOTE|[0-9:.]+ -->|^[[:space:]]*$)' "$f" \
+        | sed -E 's/<[^>]+>//g; s/&nbsp;/ /g' | awk '!seen[$0]++'
+    else echo "(no transcript available)"; fi
+    rm -rf "$tmp" ;;
+
+  rss) # reach rss <feed-url>
+    [ $# -ge 1 ] || { echo "usage: reach rss <feed-url>" >&2; exit 2; }
+    curl -s --max-time 25 -A "$UA" "$1" | python3 -c '
+import sys, re, xml.etree.ElementTree as ET
+raw = sys.stdin.read()
+raw = re.sub(r"xmlns(:\w+)?=\"[^\"]*\"", "", raw)   # drop namespace decls
+raw = re.sub(r"(</?)[A-Za-z][\w.-]*:", r"\1", raw)   # drop element prefixes (atom:, content:, dc:)
+raw = re.sub(r"\s[A-Za-z][\w.-]*:([A-Za-z_][\w.-]*=)", r" \1", raw)  # drop attribute prefixes
+try: root = ET.fromstring(raw)
+except Exception as e: print("parse error:", e); sys.exit(0)
+items = root.findall(".//item") or root.findall(".//entry")
+for it in items[:15]:
+    t = (it.findtext("title") or "").strip()
+    l = it.findtext("link") or ""
+    if not l:
+        le = it.find("link"); l = le.get("href") if le is not None else ""
+    d = (it.findtext("pubDate") or it.findtext("updated") or it.findtext("published") or "").strip()
+    print(f"- {t}\n  {l}  {d}")
+' ;;
+
+  repo) # reach repo <org/repo>   (GitHub metadata + README via gh)
+    [ $# -ge 1 ] || { echo "usage: reach repo <org/repo>" >&2; exit 2; }
+    gh api "repos/$1" --jq '"\(.full_name) | ⭐\(.stargazers_count) | \(.language) | \(.description // "")\npushed \(.pushed_at) | license \(.license.spdx_id // "none") | \(.open_issues_count) open issues"' 2>/dev/null || echo "gh api failed for $1"
+    echo "--- README (head) ---"
+    gh api "repos/$1/readme" -H "Accept: application/vnd.github.raw" 2>/dev/null | sed -n '1,60p' ;;
+
+  instagram|ig) # reach instagram <username|url> [limit]   (Apify actor, no cookies / no account risk)
+    [ $# -ge 1 ] || { echo "usage: reach instagram <username|url> [limit]" >&2; exit 2; }
+    [ -n "${APIFY_TOKEN:-}" ] || { echo "reach: APIFY_TOKEN not set in $KEYS" >&2; exit 3; }
+    case "$1" in http*) url="$1";; *) url="https://www.instagram.com/${1#@}/";; esac
+    lim="${2:-8}"
+    curl -s --max-time 180 -X POST "https://api.apify.com/v2/acts/apify~instagram-scraper/run-sync-get-dataset-items?token=$APIFY_TOKEN" \
+      -H "Content-Type: application/json" \
+      -d "$(jq -n --arg u "$url" --argjson n "$lim" '{directUrls:[$u], resultsType:"posts", resultsLimit:$n, addParentData:false}')" \
+    | jq -r 'if type=="array" then .[] | "- \(.type // "post") | \(.timestamp // "") | hearts:\(.likesCount // 0) comments:\(.commentsCount // 0)\n  \(.url // "")\n  \((.caption // "") | gsub("\\s+";" ") | .[0:200])" else "apify error: \(.error.message // .)" end' ;;
+
+  reddit) # reach reddit <query...>   or   reach reddit r/<sub> <query>   (Apify search: no app, no cookies, no account risk)
+    [ $# -ge 1 ] || { echo "usage: reach reddit <query...>   |   reach reddit r/<sub> <query>" >&2; exit 2; }
+    [ -n "${APIFY_TOKEN:-}" ] || { echo "reach: APIFY_TOKEN not set in $KEYS" >&2; exit 3; }
+    comm=""; case "$1" in r/*) comm="${1#r/}"; shift ;; esac
+    q="$*"; [ -n "$q" ] || q="$comm"
+    input="$(jq -n --arg q "$q" --arg c "$comm" '{searches:[$q], searchPosts:true, searchComments:false, searchCommunities:false, sort:"relevance", maxItems:15, includeMediaLinks:true, skipComments:true} + (if $c != "" then {searchCommunityName:$c} else {} end)')"
+    curl -s --max-time 200 -X POST "https://api.apify.com/v2/acts/trudax~reddit-scraper-lite/run-sync-get-dataset-items?token=$APIFY_TOKEN" \
+      -H "Content-Type: application/json" -d "$input" \
+    | jq -r 'if type=="array" then ([.[] | select(.dataType=="post")] | if length==0 then "(no posts found)" else (.[] | "- [\(.communityName // "")] \(.title)\n  \(.url)  up:\(.upVotes // 0) comments:\(.numberOfComments // 0)") end) else "apify error: \(.error.message // .)" end' ;;
+
+  transcribe) # reach transcribe <audio-url|file>   (Groq Whisper, free key)
+    [ $# -ge 1 ] || { echo "usage: reach transcribe <audio-url-or-file>" >&2; exit 2; }
+    [ -n "${GROQ_API_KEY:-}" ] || { echo "reach: GROQ_API_KEY not set in $KEYS (free at https://console.groq.com/keys)" >&2; exit 3; }
+    src="$1"; tmp="$(mktemp -d)"; f="$src"
+    case "$src" in
+      http*) yt-dlp -q --no-warnings -x --audio-format mp3 -o "$tmp/a.%(ext)s" "$src" 2>/dev/null || curl -s -L --max-time 180 -A "$UA" "$src" -o "$tmp/a.mp3"
+             f="$(ls "$tmp"/a.* 2>/dev/null | head -1)" ;;
+    esac
+    [ -f "$f" ] || { echo "reach: could not obtain audio from $src" >&2; rm -rf "$tmp"; exit 1; }
+    curl -s --max-time 300 "https://api.groq.com/openai/v1/audio/transcriptions" \
+      -H "Authorization: Bearer $GROQ_API_KEY" \
+      -F "file=@$f" -F "model=whisper-large-v3-turbo" -F "response_format=text"
+    rm -rf "$tmp" ;;
+
+  x|twitter) # reach x <query>  |  reach x user <handle>   (routes to agent-reach; needs cookie backend)
+    [ $# -ge 1 ] || { echo "usage: reach x <query>  |  reach x user <handle>" >&2; exit 2; }
+    b="$(_ar_backend twitter)"; [ "$b" = none ] && _need_social twitter "agent-reach install --channels twitter"
+    if [ "$1" = user ]; then shift; twitter-cli user "$1" 2>/dev/null || opencli twitter user "$1" -f yaml
+    else twitter-cli search "$*" 2>/dev/null || opencli twitter search "$*" -f yaml; fi ;;
+
+  linkedin) # reach linkedin <profile-url>  |  reach linkedin <search query>   (routes to agent-reach)
+    [ $# -ge 1 ] || { echo "usage: reach linkedin <profile-url>  |  reach linkedin <search query>" >&2; exit 2; }
+    b="$(_ar_backend linkedin)"; [ "$b" = none ] && _need_social linkedin "agent-reach install --channels linkedin"
+    case "$1" in http*) mcporter call "linkedin-scraper.get_person_profile(linkedin_url: \"$1\")" ;;
+                 *) mcporter call "linkedin-scraper.search_people(keyword: \"$*\", limit: 10)" ;; esac ;;
+
+  facebook|fb) # reach facebook <query>   (routes to agent-reach)
+    [ $# -ge 1 ] || { echo "usage: reach facebook <query>" >&2; exit 2; }
+    b="$(_ar_backend facebook)"; [ "$b" = none ] && _need_social facebook "agent-reach install --channels facebook"
+    opencli facebook search "$*" -f yaml ;;
+
+  crawl) # reach crawl {map <domain>|site <url>} [flags]   (Firecrawl, USES CREDITS)
+    sub="${1:-}"; shift 2>/dev/null || true
+    case "$sub" in
+      map)  firecrawl map "$@" ;;
+      site) firecrawl crawl "$@" ;;
+      *) echo "usage: reach crawl {map <domain>|site <url>} [flags]   (uses Firecrawl credits; free tier ~1000/mo)" >&2; exit 2 ;;
+    esac ;;
+
+  doctor) # reach doctor   (what works right now)
+    ok(){ printf '  \033[32m✓\033[0m %-14s %s\n' "$1" "$2"; }
+    no(){ printf '  \033[31m✗\033[0m %-14s %s\n' "$1" "$2"; }
+    echo "reach doctor | server-less internet fetch"
+    command -v curl >/dev/null && ok curl "any HTTP" || no curl "missing"
+    curl -s --max-time 12 -o /dev/null -w '' "https://r.jina.ai/https://example.com" 2>/dev/null \
+      && ok "web (jina)" "reach web <url>  [jina key: $([ -n "${JINA_API_KEY:-}" ] && echo set || echo none)]" || no "web (jina)" "unreachable"
+    ok "repo-wiki" "reach repo-wiki <org/repo>  (DeepWiki via jina)"
+    if [ -n "${EXA_API_KEY:-}" ]; then ok "search (exa)" "key set"; else no "search (exa)" "set EXA_API_KEY in $KEYS"; fi
+    command -v yt-dlp >/dev/null && ok yt "reach yt <url>  ($(yt-dlp --version 2>/dev/null))" || no yt "pipx install yt-dlp"
+    if command -v gh >/dev/null && gh auth status >/dev/null 2>&1; then ok gh "reach repo <org/repo>  (authed)"; else no gh "gh auth login"; fi
+    ok rss "reach rss <feed>"
+    if command -v firecrawl >/dev/null; then ok firecrawl "reach crawl map|site  ($(firecrawl --version 2>/dev/null))"; else no firecrawl "npm i -g firecrawl-cli"; fi
+    command -v pandoc >/dev/null && ok pandoc "html->md" || no pandoc "brew install pandoc"
+    if [ -n "${APIFY_TOKEN:-}" ]; then ok instagram "reach instagram <user>  (Apify, no cookies)"; else no instagram "set APIFY_TOKEN in $KEYS"; fi
+    if [ -n "${APIFY_TOKEN:-}" ]; then ok reddit "reach reddit <sub>  (Apify, no app/cookies)"; else no reddit "set APIFY_TOKEN in $KEYS"; fi
+    if [ -n "${GROQ_API_KEY:-}" ]; then ok transcribe "reach transcribe <audio>  (Groq Whisper)"; else no transcribe "set GROQ_API_KEY in $KEYS (free)"; fi
+    for p in twitter linkedin facebook; do
+      b="$(_ar_backend "$p")"
+      if [ "$b" != none ]; then ok "$p" "reach $p  (via agent-reach: $b)"
+      else printf '  \033[33m~\033[0m %-14s %s\n' "$p" "reach $p  (routes to agent-reach; needs burner setup)"; fi
+    done ;;
+
+  help|--help|-h|*)
+    cat <<'EOF'
+reach | server-less internet fetch (direct APIs + CLIs, no MCP, no RAM)
+
+  reach web <url>            clean markdown of any page (JS-rendered), via Jina Reader
+  reach repo-wiki <org/repo> DeepWiki repo explainer (via Jina)
+  reach search <query>       web search via Exa API (needs EXA_API_KEY)
+  reach yt <url>             YouTube metadata + auto transcript (yt-dlp)
+  reach rss <feed-url>       latest items from an RSS/Atom feed
+  reach repo <org/repo>      GitHub metadata + README (gh)
+  reach instagram <user>     Instagram posts (Apify actor, needs APIFY_TOKEN)
+  reach reddit <query>       Reddit search (Apify, no app); scope with: reach reddit r/<sub> <query>
+  reach transcribe <audio>   audio/podcast -> text (Groq Whisper, needs GROQ_API_KEY)
+  reach x <query>            X/Twitter    (routes to agent-reach, needs burner setup)
+  reach linkedin <url|query> LinkedIn     (routes to agent-reach, needs burner setup)
+  reach facebook <query>     Facebook     (routes to agent-reach, needs burner setup)
+  reach crawl map <domain>   discover URLs (Firecrawl, uses credits)
+  reach crawl site <url>     managed JS crawl (Firecrawl, uses credits)
+  reach doctor               what works right now
+
+reach is the single front door: each command auto-picks its backend; the cookie-gated
+platforms (x/linkedin/facebook) route to agent-reach under the hood.
+Keys: ~/.reach/keys.env  ->  EXA_API_KEY, JINA_API_KEY, FIRECRAWL_API_KEY, APIFY_TOKEN (IG+Reddit), GROQ_API_KEY
+EOF
+    ;;
+esac
