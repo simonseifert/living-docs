@@ -111,7 +111,8 @@ for it in items[:15]:
     [ -n "${APIFY_TOKEN:-}" ] || { echo "reach: APIFY_TOKEN not set in $KEYS" >&2; exit 3; }
     case "$1" in http*) url="$1";; *) url="https://www.instagram.com/${1#@}/";; esac
     lim="${2:-8}"
-    curl -s --max-time 180 -X POST "https://api.apify.com/v2/acts/apify~instagram-scraper/run-sync-get-dataset-items?token=$APIFY_TOKEN" \
+    curl -s --max-time 180 -X POST "https://api.apify.com/v2/acts/apify~instagram-scraper/run-sync-get-dataset-items" \
+      -H "Authorization: Bearer $APIFY_TOKEN" \
       -H "Content-Type: application/json" \
       -d "$(jq -n --arg u "$url" --argjson n "$lim" '{directUrls:[$u], resultsType:"posts", resultsLimit:$n, addParentData:false}')" \
     | jq -r 'if type=="array" then .[] | "- \(.type // "post") | \(.timestamp // "") | hearts:\(.likesCount // 0) comments:\(.commentsCount // 0)\n  \(.url // "")\n  \((.caption // "") | gsub("\\s+";" ") | .[0:200])" else "apify error: \(.error.message // .)" end' ;;
@@ -122,7 +123,8 @@ for it in items[:15]:
     comm=""; case "$1" in r/*) comm="${1#r/}"; shift ;; esac
     q="$*"; [ -n "$q" ] || q="$comm"
     input="$(jq -n --arg q "$q" --arg c "$comm" '{searches:[$q], searchPosts:true, searchComments:false, searchCommunities:false, sort:"relevance", maxItems:15, includeMediaLinks:true, skipComments:true} + (if $c != "" then {searchCommunityName:$c} else {} end)')"
-    curl -s --max-time 200 -X POST "https://api.apify.com/v2/acts/trudax~reddit-scraper-lite/run-sync-get-dataset-items?token=$APIFY_TOKEN" \
+    curl -s --max-time 200 -X POST "https://api.apify.com/v2/acts/trudax~reddit-scraper-lite/run-sync-get-dataset-items" \
+      -H "Authorization: Bearer $APIFY_TOKEN" \
       -H "Content-Type: application/json" -d "$input" \
     | jq -r 'if type=="array" then ([.[] | select(.dataType=="post")] | if length==0 then "(no posts found)" else (.[] | "- [\(.communityName // "")] \(.title)\n  \(.url)  up:\(.upVotes // 0) comments:\(.numberOfComments // 0)") end) else "apify error: \(.error.message // .)" end' ;;
 
