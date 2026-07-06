@@ -90,11 +90,19 @@ Follow `references/discovery-playbook.md` for the full per-surface how-to. Summa
 
 ## Refresh algorithm
 
-1. Read the tool's `sources.yaml`. Compute staleness per section (`now - last_fetched` vs `ttl_days`). `scripts/stale.py <tool>` does this.
-2. Re-fetch only stale sections (or the ones named in `--section`). Cheap first: poll the change_detector (OpenAPI version string, RSS pubDate, GitHub release tag) before re-scraping anything.
-3. Update only the changed parts of `brief.md`, restamp `last_fetched`, and record the concrete deltas.
-4. **Log the changes.** Prepend a dated entry to `<tool>/history.md` listing exactly what moved (e.g. "pricing Starter $20 -> $24; n8n 2.28 -> 2.29; status/community restamped, no change"). If nothing changed, log "checked, no change". Mirror a one-liner into `CHANGELOG.md`.
-5. Commit with `git commit -m "docs: refresh <tool> (<sections>)"`.
+Detection is free (pure local Python, no model). Only the actual re-read and patch
+spends a model, and that model is a cheap one, never the agent's own tokens.
+
+1. Read the tool's `sources.yaml`. Compute staleness per section (`now - last_fetched` vs `ttl_days`). `scripts/stale.py <tool>` does this. (Free.)
+2. Re-fetch only stale sections (or the ones named in `--section`). Cheap first: poll the change_detector (OpenAPI version string, RSS pubDate, GitHub release tag) before re-scraping anything. Fetch with `reach`.
+3. **Compare with a cheap model, not the agent.** `scripts/groq_refresh.py --old <section>.md --fetched <slice>.md --section <name> --tool <tool>` sends the current section plus the freshly-fetched source to an OpenAI-compatible cheap model (Groq `openai/gpt-oss-120b` by default; `--provider deepseek` for stronger judgment or bigger inputs) and returns JSON `{changed, summary, updated_section}`. Send a focused slice of the source, not the whole page (Groq caps request size). Apply `updated_section` only when `changed` is true.
+4. Restamp `last_fetched` (and flip `status` to `ok`) for every section you re-verified, including the ones that did not change.
+5. **Log the changes.** Prepend a dated entry to `<tool>/history.md` listing exactly what moved (e.g. "pricing Starter $20 -> $24; n8n 2.28 -> 2.29; status/community restamped, no change"). If nothing changed, log "checked, no change". Mirror a one-liner into `CHANGELOG.md`.
+6. Commit with `git commit -m "docs: refresh <tool> (<sections>)"`.
+
+### Weekly freshness ping (optional)
+
+`scripts/docs_freshness.py` runs `stale.py` and sends ONE ntfy notification listing the content-stale sections, so you learn what drifted instead of checking by hand. It is model-free (detection only, zero cost) and skips live `status` sections by default (`ttl_days: 1` means they always read as stale, which is noise). Point it at an ntfy config (see `examples/ntfy.example.json`) via `$DOCS_NTFY_CONFIG`, then schedule it with launchd or cron. Refreshing stays your call: the ping tells you which tool to run `/docs refresh` on.
 
 ## Audit trail (what is tracked)
 

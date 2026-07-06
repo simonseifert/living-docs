@@ -1,0 +1,7 @@
+{
+  "ntfy": {
+    "server": "https://ntfy.sh",
+    "topic": "your-private-topic-name",
+    "auth_token": ""
+  }
+}

@@ -61,6 +61,15 @@ A fully worked, public example ships at
 [`examples/apify/brief.md`](examples/apify/brief.md), a brief for the Apify scraping
 platform built by this skill. It is the depth bar.
 
+## Keeping briefs fresh, cheaply
+
+The point of a "living" reference is that maintenance stays cheap. Two moves keep it that way:
+
+- **Detection is free.** `scripts/stale.py` is pure local Python: it reads each `sources.yaml`, compares `last_fetched + ttl_days` against today, and prints what is stale. No model, no network, no cost. `/docs --stale` runs it.
+- **Only patching spends a model, and a cheap one.** When a section is stale, `reach` re-fetches the source and `scripts/groq_refresh.py` asks an OpenAI-compatible cheap model whether the facts actually changed, returning a corrected section only if they did. Groq `gpt-oss-120b` is the default (fast, free-tier); `--provider deepseek` swaps in DeepSeek for stronger judgment or bigger inputs. Your main agent is never in this loop, so refreshing does not burn frontier tokens.
+
+Optional: `scripts/docs_freshness.py` runs the free detector on a schedule (launchd or cron) and sends one ntfy push listing what drifted, so you refresh on a signal instead of from memory. Copy [`examples/ntfy.example.json`](examples/ntfy.example.json), set `$DOCS_NTFY_CONFIG`, and schedule it.
+
 ## Commands
 
 ```
@@ -80,13 +89,18 @@ is the fetch layer `/docs` runs on, and it stands alone as a CLI.
 ```
 reach web <url>             clean markdown of any page (JS-rendered), via Jina Reader
 reach search <query>        web search (Exa, with a Jina fallback)
-reach repo-wiki <org/repo>  DeepWiki repo explainer
+reach repo-wiki <org/repo>  DeepWiki explainer of how a codebase actually works
 reach yt <url>              YouTube metadata + transcript
 reach rss <feed>            latest items from a feed
 reach repo <org/repo>       GitHub metadata + README
 reach crawl map|site        managed JS crawl (Firecrawl) for the hard cases
 reach doctor                what works right now
 ```
+
+`repo-wiki` is worth calling out: it pulls a [DeepWiki](https://deepwiki.com) explainer of a
+repository (architecture, data flow, key modules), which beats a bare README when you are
+writing accurate gotchas and recipes for a tool. It reads DeepWiki through Jina keylessly,
+and falls back to the DeepWiki MCP (which also answers free-form `ask_question` queries).
 
 The keyless commands (`web`, `repo-wiki`, `yt`, `rss`, `repo`) work out of the box. Search
 and the crawl paths use optional API keys, kept in `~/.reach/keys.env` (gitignored, chmod
@@ -110,7 +124,8 @@ defaults to `~/docs-reference` (override with `DOCS_REFERENCE_DIR`). Then, in Cl
 ```
 
 Optional, for a stronger `reach`: install `yt-dlp`, `gh`, and `pandoc`, and add any of
-`EXA_API_KEY`, `JINA_API_KEY`, `FIRECRAWL_API_KEY` to `~/.reach/keys.env`.
+`EXA_API_KEY`, `JINA_API_KEY`, `FIRECRAWL_API_KEY` to `~/.reach/keys.env`. For cheap-model
+brief refreshing, add `GROQ_API_KEY` (free tier) or `DEEPSEEK_API_KEY`.
 
 ## What this is, and what it is not
 
