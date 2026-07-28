@@ -29,10 +29,18 @@ _need_social() { # $1=platform  $2=setup hint
 }
 _apify_limit() {
   local limit="${REACH_APIFY_LIMIT:-20}"
-  if ! [[ "$limit" =~ ^[0-9]+$ ]] || (( limit < 1 || limit > 200 )); then
+  if ! [[ "$limit" =~ ^[0-9]+$ ]]; then
     echo "reach: REACH_APIFY_LIMIT must be an integer from 1 to 200" >&2
     return 2
   fi
+  while [[ ${#limit} -gt 1 && "$limit" == 0* ]]; do
+    limit="${limit#0}"
+  done
+  if (( ${#limit} > 3 )) || (( 10#$limit < 1 || 10#$limit > 200 )); then
+    echo "reach: REACH_APIFY_LIMIT must be an integer from 1 to 200" >&2
+    return 2
+  fi
+  limit=$((10#$limit))
   printf '%s' "$limit"
 }
 _apify_items() { # $1=actor id with ~ separator  $2=input JSON
@@ -162,7 +170,10 @@ for it in items[:15]:
       | jq -c 'if type=="array" then .[] else . end' ;;
 
   x-followers|twitter-followers) # public follower relations through Xquik X Follower Scraper
-    [ $# -ge 1 ] || { echo "usage: reach x-followers <handle> [followers|following|verified_followers]" >&2; exit 2; }
+    [ $# -ge 1 ] && [ $# -le 2 ] || {
+      echo "usage: reach x-followers <handle> [followers|following|verified_followers]" >&2
+      exit 2
+    }
     handle="${1#@}"
     relation="${2:-followers}"
     case "$relation" in
@@ -171,7 +182,7 @@ for it in items[:15]:
     esac
     lim="$(_apify_limit)" || exit $?
     input="$(jq -n --arg h "$handle" --arg r "$relation" --argjson n "$lim" \
-      '{twitterHandles:[$h], relation:$r, maxItems:$n, maxItemsPerTarget:$n, outputMode:"compact", overlapMode:"none", includeTargetMetadata:true}')"
+      '{twitterHandles:[$h], relation:$r, maxItems:$n, maxItemsPerTarget:$n, outputMode:"compact", overlapMode:false, includeTargetMetadata:true}')"
     _apify_items "xquik~x-follower-scraper" "$input" \
       | jq -c 'if type=="array" then .[] else . end' ;;
 
