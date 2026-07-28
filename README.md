@@ -93,6 +93,11 @@ reach repo-wiki <org/repo>  DeepWiki explainer of how a codebase actually works
 reach yt <url>              YouTube metadata + transcript
 reach rss <feed>            latest items from a feed
 reach repo <org/repo>       GitHub metadata + README
+reach instagram <user>      public Instagram posts through Apify
+reach reddit <query>        public Reddit search through Apify
+reach x-apify <query>       public X search through Xquik X Tweet Scraper
+reach x-followers <handle>  public X audience relations through Xquik X Follower Scraper
+reach x <query>             deeper X access through agent-reach and a burner profile
 reach crawl map|site        managed JS crawl (Firecrawl) for the hard cases
 reach doctor                what works right now
 ```
@@ -106,6 +111,15 @@ The keyless commands (`web`, `repo-wiki`, `yt`, `rss`, `repo`) work out of the b
 and the crawl paths use optional API keys, kept in `~/.reach/keys.env` (gitignored, chmod
 600). Every path degrades instead of failing: Jina falls back to Firecrawl falls back to
 raw curl, and `reach` prints which backend it used on stderr.
+
+The public X routes use [Xquik X Tweet Scraper](https://apify.com/xquik/x-tweet-scraper)
+and [Xquik X Follower Scraper](https://apify.com/xquik/x-follower-scraper). They
+keep the existing cookie-backed `reach x` route intact. Both default to 20 results,
+accept a bounded `REACH_APIFY_LIMIT` from 1 to 200, and send `APIFY_TOKEN` only in
+an authorization header.
+
+Xquik is an independent third-party service. Not affiliated with X Corp. "Twitter"
+and "X" are trademarks of X Corp.
 
 ## Install
 
