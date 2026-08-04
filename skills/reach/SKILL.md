@@ -35,6 +35,7 @@ reach reddit <query>        Reddit search (scope with r/<sub> <query>), no cooki
 reach x-apify <query>       Public X search through Xquik X Tweet Scraper                [uses APIFY_TOKEN]
 reach x-apify user <handle> Public X timeline through Xquik X Tweet Scraper              [uses APIFY_TOKEN]
 reach x-followers <handle>  Public followers/following through Xquik X Follower Scraper  [uses APIFY_TOKEN]
+reach doc <file>            Word/PPT/Excel/PDF/EPUB/ODF/RTF/CSV -> markdown             [keyless, local]
 reach transcribe <audio>    audio/podcast/video -> text (Groq Whisper)                 [needs GROQ_API_KEY]
 reach x <query>             X/Twitter (routes to agent-reach)                          [needs burner setup]
 reach linkedin <url|query>  LinkedIn (routes to agent-reach)                           [needs burner setup]
@@ -50,6 +51,7 @@ reach doctor                what works right now
 
 - **Direct API / CLI over MCP servers.** Local MCP servers cost RAM; remote MCP servers cost always-loaded context. A stateless curl/CLI call costs neither. Only reach for an MCP when a source has no usable direct endpoint (e.g. grep.app blocks direct calls; use its remote MCP if you need it).
 - **Keyless by default.** web / repo-wiki / yt / rss / repo / crawl need no key of ours. Only `search` (Exa) needs a key. Optional `JINA_API_KEY` raises the web-read rate limit. Keys live in `~/.reach/keys.env` (gitignored, chmod 600), never in a brief, node, or repo.
+- **Local files stay local.** `reach doc` converts Word/PowerPoint/Excel/PDF/EPUB/ODF on this machine via anydoc (pure Rust, no ML, no service, no key, median <5ms). Firecrawl's hosted /parse does the same conversion, but these are usually a client's contract or RFP — do not send one to a third party to read it. The one exception is a scanned/image-only PDF, which needs OCR; anydoc says so explicitly and the error names the hosted fallback.
 - **Cost ladder for reading pages:** `reach web` (free Jina) for single pages incl. JS → `reach crawl` (Firecrawl, credits) ONLY when you need URL discovery with no sitemap, or SPA click/scroll interaction. Do not `crawl` a large predictable-URL KB (curl+pandoc is free for that).
 - **One front door, explicit X routes.** `reach instagram`, `reach reddit`, `reach x-apify`, and `reach x-followers` run through Apify Actors directly. `reach x` remains the deeper cookie-backed route through `agent-reach`; adding Actor routes does not replace it. Use `reach x-apify` for public posts and `reach x-followers` for public audience relations without a browser account.
 

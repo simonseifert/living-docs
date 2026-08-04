@@ -98,6 +98,7 @@ reach reddit <query>        public Reddit search through Apify
 reach x-apify <query>       public X search through Xquik X Tweet Scraper
 reach x-followers <handle>  public X audience relations through Xquik X Follower Scraper
 reach x <query>             deeper X access through agent-reach and a burner profile
+reach doc <file>            local Word/PPT/Excel/PDF/EPUB -> markdown, keyless
 reach crawl map|site        managed JS crawl (Firecrawl) for the hard cases
 reach doctor                what works right now
 ```

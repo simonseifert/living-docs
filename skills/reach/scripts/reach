@@ -191,6 +191,30 @@ for it in items[:15]:
     _apify_items "xquik~x-follower-scraper" "$input" \
       | jq -c 'if type=="array" then .[] else . end' ;;
 
+  doc) # reach doc <file.docx|pptx|xlsx|pdf|epub|odt|rtf|csv>   (anydoc, local, keyless)
+    # The one gap in reach: everything else reads the public web, nothing read a
+    # file already on disk. Client briefs and RFPs arrive as .docx and .pdf, and
+    # an agent could not open them.
+    #
+    # Local on purpose. Firecrawl's hosted /parse does the same conversion, but
+    # these are usually someone's contract — converting locally means it never
+    # leaves the machine. anydoc is pure Rust, no ML, no service, median <5ms.
+    [ $# -ge 1 ] || { echo "usage: reach doc <file>   (docx pptx xlsx odt rtf epub csv pdf)" >&2; exit 2; }
+    [ -f "$1" ] || { echo "reach: no such file: $1" >&2; exit 1; }
+    command -v uv >/dev/null || { echo "reach: needs uv (https://docs.astral.sh/uv/) for the anydoc wheel" >&2; exit 3; }
+    uv run --quiet --with firecrawl-anydoc python -c '
+import sys, anydoc
+try:
+    sys.stdout.write(anydoc.to_markdown(sys.argv[1]))
+except Exception as exc:
+    msg = str(exc)
+    sys.stderr.write("reach: anydoc could not convert this file: %s\n" % msg)
+    if "nsupported" in msg or "scan" in msg.lower():
+        sys.stderr.write("       Scanned/image-only PDFs need OCR. Try Firecrawl:\n")
+        sys.stderr.write("       curl -s https://api.firecrawl.dev/v2/parse -H \"Authorization: Bearer $FIRECRAWL_API_KEY\" -F file=@%s\n" % sys.argv[1])
+    sys.exit(1)
+' "$1" ;;
+
   transcribe) # reach transcribe <audio-url|file>   (Groq Whisper, free key)
     [ $# -ge 1 ] || { echo "usage: reach transcribe <audio-url-or-file>" >&2; exit 2; }
     [ -n "${GROQ_API_KEY:-}" ] || { echo "reach: GROQ_API_KEY not set in $KEYS (free at https://console.groq.com/keys)" >&2; exit 3; }
@@ -257,6 +281,7 @@ for it in items[:15]:
       no x-apify "set APIFY_TOKEN in $KEYS"
       no x-followers "set APIFY_TOKEN in $KEYS"
     fi
+    if command -v uv >/dev/null; then ok doc "reach doc <file>  (anydoc, local, no key)"; else no doc "install uv for reach doc"; fi
     if [ -n "${GROQ_API_KEY:-}" ]; then ok transcribe "reach transcribe <audio>  (Groq Whisper)"; else no transcribe "set GROQ_API_KEY in $KEYS (free)"; fi
     for p in twitter linkedin facebook; do
       b="$(_ar_backend "$p")"
@@ -279,6 +304,7 @@ reach | server-less internet fetch (direct APIs + CLIs, no MCP, no RAM)
   reach x-apify <query>      Public X search via Xquik X Tweet Scraper
   reach x-apify user <handle> Public X timeline via Xquik X Tweet Scraper
   reach x-followers <handle> Public follower relations via Xquik X Follower Scraper
+  reach doc <file>           Word/PPT/Excel/PDF/EPUB/ODF -> markdown (local, keyless)
   reach transcribe <audio>   audio/podcast -> text (Groq Whisper, needs GROQ_API_KEY)
   reach x <query>            X/Twitter    (routes to agent-reach, needs burner setup)
   reach linkedin <url|query> LinkedIn     (routes to agent-reach, needs burner setup)
