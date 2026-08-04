@@ -1,6 +1,17 @@
 ---
 name: reach
-description: Server-less internet fetch for agents | read any web page (JS-rendered), search the web, pull YouTube transcripts, RSS feeds, GitHub repos/READMEs, DeepWiki repo explainers, and managed JS crawls. One CLI (`reach`) that shells out to direct HTTP APIs + already-installed tools (Jina Reader, Exa, yt-dlp, gh, Firecrawl), with NO MCP servers and NO background daemons (zero RAM footprint). Use when you need to fetch or search public internet content from the command line. Also does account-safe social with no cookies: Instagram and Reddit (via Apify actors). Is the single front door for fetching: cookie-gated deep social (X/Twitter, Facebook, LinkedIn) uses the same surface via `reach x|linkedin|facebook`, which routes to `agent-reach` under the hood (needs a burner Chrome profile).
+description: >-
+  Server-less internet fetch for agents | read any web page (JS-rendered),
+  search the web, pull YouTube transcripts, RSS feeds, GitHub repos/READMEs,
+  DeepWiki repo explainers, and managed JS crawls. One CLI (`reach`) that
+  shells out to direct HTTP APIs + already-installed tools (Jina Reader, Exa,
+  yt-dlp, gh, Firecrawl), with NO MCP servers and NO background daemons (zero
+  RAM footprint). Use when you need to fetch or search public internet content
+  from the command line. Also does account-safe social with no cookies:
+  Instagram, Reddit, and public X data (via Apify actors). Is the single front
+  door for fetching: cookie-gated deep social (X/Twitter, Facebook, LinkedIn)
+  uses the same surface via `reach x|linkedin|facebook`, which routes to
+  `agent-reach` under the hood (needs a burner Chrome profile).
 trigger: /reach
 ---
 
@@ -21,6 +32,9 @@ reach rss <feed-url>        latest ~15 items from an RSS/Atom feed              
 reach repo <org/repo>       GitHub metadata + README (gh)                              [keyless, uses gh auth]
 reach instagram <user>      Instagram posts (Apify actor, no cookies/account risk)     [needs APIFY_TOKEN]
 reach reddit <query>        Reddit search (scope with r/<sub> <query>), no cookies       [uses APIFY_TOKEN]
+reach x-apify <query>       Public X search through Xquik X Tweet Scraper                [uses APIFY_TOKEN]
+reach x-apify user <handle> Public X timeline through Xquik X Tweet Scraper              [uses APIFY_TOKEN]
+reach x-followers <handle>  Public followers/following through Xquik X Follower Scraper  [uses APIFY_TOKEN]
 reach transcribe <audio>    audio/podcast/video -> text (Groq Whisper)                 [needs GROQ_API_KEY]
 reach x <query>             X/Twitter (routes to agent-reach)                          [needs burner setup]
 reach linkedin <url|query>  LinkedIn (routes to agent-reach)                           [needs burner setup]
@@ -37,7 +51,28 @@ reach doctor                what works right now
 - **Direct API / CLI over MCP servers.** Local MCP servers cost RAM; remote MCP servers cost always-loaded context. A stateless curl/CLI call costs neither. Only reach for an MCP when a source has no usable direct endpoint (e.g. grep.app blocks direct calls; use its remote MCP if you need it).
 - **Keyless by default.** web / repo-wiki / yt / rss / repo / crawl need no key of ours. Only `search` (Exa) needs a key. Optional `JINA_API_KEY` raises the web-read rate limit. Keys live in `~/.reach/keys.env` (gitignored, chmod 600), never in a brief, node, or repo.
 - **Cost ladder for reading pages:** `reach web` (free Jina) for single pages incl. JS → `reach crawl` (Firecrawl, credits) ONLY when you need URL discovery with no sitemap, or SPA click/scroll interaction. Do not `crawl` a large predictable-URL KB (curl+pandoc is free for that).
-- **One front door, routing under the hood.** `reach instagram` and `reach reddit` run through Apify actors (keyed API, no cookies, no account risk), directly here. `reach x` / `reach linkedin` / `reach facebook` are the SAME command surface but delegate to `agent-reach`'s cookie backend (a logged-in session behind a burner Chrome profile). The caller always just types `reach <platform>`; reach decides whether that is a direct API call or an agent-reach delegation. Cookie-social stays gated behind the burner profile for account safety, and prints its setup step until configured.
+- **One front door, explicit X routes.** `reach instagram`, `reach reddit`, `reach x-apify`, and `reach x-followers` run through Apify Actors directly. `reach x` remains the deeper cookie-backed route through `agent-reach`; adding Actor routes does not replace it. Use `reach x-apify` for public posts and `reach x-followers` for public audience relations without a browser account.
+
+## Public X via Xquik Actors
+
+Use [Xquik X Tweet Scraper](https://apify.com/xquik/x-tweet-scraper) for public searches and account timelines:
+
+```bash
+reach x-apify '"web scraping" lang:en'
+reach x-apify user apify
+```
+
+Use [Xquik X Follower Scraper](https://apify.com/xquik/x-follower-scraper) for public audience relations:
+
+```bash
+reach x-followers apify
+reach x-followers apify following
+reach x-followers apify verified_followers
+```
+
+Both commands return newline-delimited JSON. They cap runs at 20 items by default. Set `REACH_APIFY_LIMIT` from 1 to 200 when a different bound is justified. Check each Actor's current Store pricing before a larger run. Keep `APIFY_TOKEN` only in the protected key file; `reach` sends it in an authorization header and never places it in a URL. Treat returned profile data as personal data, minimize collection, and keep provenance with downstream summaries.
+
+Xquik is an independent third-party service. Not affiliated with X Corp. "Twitter" and "X" are trademarks of X Corp.
 
 ## Fallbacks and MCP backups
 

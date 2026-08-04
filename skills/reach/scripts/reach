@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # reach | a thin, server-less internet-fetch router.
 # Direct HTTP APIs + already-installed CLIs. No MCP servers, no daemons, no RAM footprint.
-# Keys (optional) live in ~/.reach/keys.env (gitignored): EXA_API_KEY, JINA_API_KEY.
-# Social platforms (Reddit/X/IG/FB) are NOT here on purpose | use `agent-reach` for those.
+# Keys (optional) live in ~/.reach/keys.env (gitignored): EXA_API_KEY, JINA_API_KEY, APIFY_TOKEN.
+# Cookie-backed social still routes through `agent-reach`; public Actor routes run directly.
 set -uo pipefail
 
 KEYS="${REACH_KEYS:-$HOME/.reach/keys.env}"
+# shellcheck source=/dev/null
 [ -f "$KEYS" ] && { set -a; . "$KEYS"; set +a; }
 UA="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) reach/1.0"
 
@@ -25,6 +26,30 @@ _need_social() { # $1=platform  $2=setup hint
   echo "       not configured yet. enable with: $2" >&2
   echo "       then check: agent-reach doctor --json | jq .$1" >&2
   exit 4
+}
+_apify_limit() {
+  local limit="${REACH_APIFY_LIMIT:-20}"
+  if ! [[ "$limit" =~ ^[0-9]+$ ]]; then
+    echo "reach: REACH_APIFY_LIMIT must be an integer from 1 to 200" >&2
+    return 2
+  fi
+  while [[ ${#limit} -gt 1 && "$limit" == 0* ]]; do
+    limit="${limit#0}"
+  done
+  if (( ${#limit} > 3 )) || (( 10#$limit < 1 || 10#$limit > 200 )); then
+    echo "reach: REACH_APIFY_LIMIT must be an integer from 1 to 200" >&2
+    return 2
+  fi
+  limit=$((10#$limit))
+  printf '%s' "$limit"
+}
+_apify_items() { # $1=actor id with ~ separator  $2=input JSON
+  [ -n "${APIFY_TOKEN:-}" ] || { echo "reach: APIFY_TOKEN not set in $KEYS" >&2; return 3; }
+  curl -fsS --max-time 240 -X POST \
+    "https://api.apify.com/v2/acts/$1/run-sync-get-dataset-items" \
+    -H "Authorization: Bearer $APIFY_TOKEN" \
+    -H "Content-Type: application/json" \
+    -d "$2"
 }
 
 cmd="${1:-help}"; shift 2>/dev/null || true
@@ -72,7 +97,7 @@ case "$cmd" in
     tmp="$(mktemp -d)"
     yt-dlp -q --no-warnings --skip-download --write-auto-subs --write-subs \
            --sub-lang "en.*" --sub-format vtt -o "$tmp/%(id)s.%(ext)s" "$1" 2>/dev/null
-    f="$(ls "$tmp"/*.vtt 2>/dev/null | head -1)"
+    f="$(find "$tmp" -maxdepth 1 -type f -name '*.vtt' -print -quit)"
     if [ -n "$f" ]; then
       echo "### transcript"
       grep -vE '^(WEBVTT|Kind:|Language:|NOTE|[0-9:.]+ -->|^[[:space:]]*$)' "$f" \
@@ -128,13 +153,46 @@ for it in items[:15]:
       -H "Content-Type: application/json" -d "$input" \
     | jq -r 'if type=="array" then ([.[] | select(.dataType=="post")] | if length==0 then "(no posts found)" else (.[] | "- [\(.communityName // "")] \(.title)\n  \(.url)  up:\(.upVotes // 0) comments:\(.numberOfComments // 0)") end) else "apify error: \(.error.message // .)" end' ;;
 
+  x-apify|twitter-apify) # public X search/timelines through Xquik X Tweet Scraper
+    [ $# -ge 1 ] || { echo "usage: reach x-apify <query>  |  reach x-apify user <handle>" >&2; exit 2; }
+    lim="$(_apify_limit)" || exit $?
+    if [ "$1" = user ]; then
+      [ $# -eq 2 ] || { echo "usage: reach x-apify user <handle>" >&2; exit 2; }
+      handle="${2#@}"
+      input="$(jq -n --arg h "$handle" --argjson n "$lim" \
+        '{mode:"profileTweets", twitterHandles:[$h], maxItems:$n, maxItemsPerTarget:$n, outputVariant:"rich", fieldStyle:"camelCase", outputPreset:"flat"}')"
+    else
+      q="$*"
+      input="$(jq -n --arg q "$q" --argjson n "$lim" \
+        '{mode:"search", searchTerms:[$q], maxItems:$n, maxItemsPerTarget:$n, outputVariant:"rich", fieldStyle:"camelCase", outputPreset:"flat", includeSearchTerms:true}')"
+    fi
+    _apify_items "xquik~x-tweet-scraper" "$input" \
+      | jq -c 'if type=="array" then .[] else . end' ;;
+
+  x-followers|twitter-followers) # public follower relations through Xquik X Follower Scraper
+    [ $# -ge 1 ] && [ $# -le 2 ] || {
+      echo "usage: reach x-followers <handle> [followers|following|verified_followers]" >&2
+      exit 2
+    }
+    handle="${1#@}"
+    relation="${2:-followers}"
+    case "$relation" in
+      followers|following|verified_followers) ;;
+      *) echo "reach: relation must be followers, following, or verified_followers" >&2; exit 2 ;;
+    esac
+    lim="$(_apify_limit)" || exit $?
+    input="$(jq -n --arg h "$handle" --arg r "$relation" --argjson n "$lim" \
+      '{twitterHandles:[$h], relation:$r, maxItems:$n, maxItemsPerTarget:$n, outputMode:"compact", overlapMode:false, includeTargetMetadata:true}')"
+    _apify_items "xquik~x-follower-scraper" "$input" \
+      | jq -c 'if type=="array" then .[] else . end' ;;
+
   transcribe) # reach transcribe <audio-url|file>   (Groq Whisper, free key)
     [ $# -ge 1 ] || { echo "usage: reach transcribe <audio-url-or-file>" >&2; exit 2; }
     [ -n "${GROQ_API_KEY:-}" ] || { echo "reach: GROQ_API_KEY not set in $KEYS (free at https://console.groq.com/keys)" >&2; exit 3; }
     src="$1"; tmp="$(mktemp -d)"; f="$src"
     case "$src" in
       http*) yt-dlp -q --no-warnings -x --audio-format mp3 -o "$tmp/a.%(ext)s" "$src" 2>/dev/null || curl -s -L --max-time 180 -A "$UA" "$src" -o "$tmp/a.mp3"
-             f="$(ls "$tmp"/a.* 2>/dev/null | head -1)" ;;
+             f="$(find "$tmp" -maxdepth 1 -type f -name 'a.*' -print -quit)" ;;
     esac
     [ -f "$f" ] || { echo "reach: could not obtain audio from $src" >&2; rm -rf "$tmp"; exit 1; }
     curl -s --max-time 300 "https://api.groq.com/openai/v1/audio/transcriptions" \
@@ -171,18 +229,29 @@ for it in items[:15]:
     ok(){ printf '  \033[32m✓\033[0m %-14s %s\n' "$1" "$2"; }
     no(){ printf '  \033[31m✗\033[0m %-14s %s\n' "$1" "$2"; }
     echo "reach doctor | server-less internet fetch"
-    command -v curl >/dev/null && ok curl "any HTTP" || no curl "missing"
-    curl -s --max-time 12 -o /dev/null -w '' "https://r.jina.ai/https://example.com" 2>/dev/null \
-      && ok "web (jina)" "reach web <url>  [jina key: $([ -n "${JINA_API_KEY:-}" ] && echo set || echo none)]" || no "web (jina)" "unreachable"
+    if command -v curl >/dev/null; then ok curl "any HTTP"; else no curl "missing"; fi
+    if [ -n "${JINA_API_KEY:-}" ]; then jina_key="set"; else jina_key="none"; fi
+    if curl -s --max-time 12 -o /dev/null -w '' "https://r.jina.ai/https://example.com" 2>/dev/null; then
+      ok "web (jina)" "reach web <url>  [jina key: $jina_key]"
+    else
+      no "web (jina)" "unreachable"
+    fi
     ok "repo-wiki" "reach repo-wiki <org/repo>  (DeepWiki via jina)"
     if [ -n "${EXA_API_KEY:-}" ]; then ok "search (exa)" "key set"; else no "search (exa)" "set EXA_API_KEY in $KEYS"; fi
-    command -v yt-dlp >/dev/null && ok yt "reach yt <url>  ($(yt-dlp --version 2>/dev/null))" || no yt "pipx install yt-dlp"
+    if command -v yt-dlp >/dev/null; then ok yt "reach yt <url>  ($(yt-dlp --version 2>/dev/null))"; else no yt "pipx install yt-dlp"; fi
     if command -v gh >/dev/null && gh auth status >/dev/null 2>&1; then ok gh "reach repo <org/repo>  (authed)"; else no gh "gh auth login"; fi
     ok rss "reach rss <feed>"
     if command -v firecrawl >/dev/null; then ok firecrawl "reach crawl map|site  ($(firecrawl --version 2>/dev/null))"; else no firecrawl "npm i -g firecrawl-cli"; fi
-    command -v pandoc >/dev/null && ok pandoc "html->md" || no pandoc "brew install pandoc"
+    if command -v pandoc >/dev/null; then ok pandoc "html->md"; else no pandoc "brew install pandoc"; fi
     if [ -n "${APIFY_TOKEN:-}" ]; then ok instagram "reach instagram <user>  (Apify, no cookies)"; else no instagram "set APIFY_TOKEN in $KEYS"; fi
     if [ -n "${APIFY_TOKEN:-}" ]; then ok reddit "reach reddit <sub>  (Apify, no app/cookies)"; else no reddit "set APIFY_TOKEN in $KEYS"; fi
+    if [ -n "${APIFY_TOKEN:-}" ]; then
+      ok x-apify "reach x-apify <query>  (Xquik Actor, public data)"
+      ok x-followers "reach x-followers <handle>  (Xquik Actor, public data)"
+    else
+      no x-apify "set APIFY_TOKEN in $KEYS"
+      no x-followers "set APIFY_TOKEN in $KEYS"
+    fi
     if [ -n "${GROQ_API_KEY:-}" ]; then ok transcribe "reach transcribe <audio>  (Groq Whisper)"; else no transcribe "set GROQ_API_KEY in $KEYS (free)"; fi
     for p in twitter linkedin facebook; do
       b="$(_ar_backend "$p")"
@@ -202,6 +271,9 @@ reach | server-less internet fetch (direct APIs + CLIs, no MCP, no RAM)
   reach repo <org/repo>      GitHub metadata + README (gh)
   reach instagram <user>     Instagram posts (Apify actor, needs APIFY_TOKEN)
   reach reddit <query>       Reddit search (Apify, no app); scope with: reach reddit r/<sub> <query>
+  reach x-apify <query>      Public X search via Xquik X Tweet Scraper
+  reach x-apify user <handle> Public X timeline via Xquik X Tweet Scraper
+  reach x-followers <handle> Public follower relations via Xquik X Follower Scraper
   reach transcribe <audio>   audio/podcast -> text (Groq Whisper, needs GROQ_API_KEY)
   reach x <query>            X/Twitter    (routes to agent-reach, needs burner setup)
   reach linkedin <url|query> LinkedIn     (routes to agent-reach, needs burner setup)
@@ -212,7 +284,8 @@ reach | server-less internet fetch (direct APIs + CLIs, no MCP, no RAM)
 
 reach is the single front door: each command auto-picks its backend; the cookie-gated
 platforms (x/linkedin/facebook) route to agent-reach under the hood.
-Keys: ~/.reach/keys.env  ->  EXA_API_KEY, JINA_API_KEY, FIRECRAWL_API_KEY, APIFY_TOKEN (IG+Reddit), GROQ_API_KEY
+Keys: ~/.reach/keys.env  ->  EXA_API_KEY, JINA_API_KEY, FIRECRAWL_API_KEY, APIFY_TOKEN (IG+Reddit+X Actors), GROQ_API_KEY
+Set REACH_APIFY_LIMIT=1..200 to change the X Actor result cap. The default is 20.
 EOF
     ;;
 esac
