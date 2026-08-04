@@ -158,11 +158,14 @@ for it in items[:15]:
       -H "Content-Type: application/json" -d "$input" \
     | jq -r 'if type=="array" then ([.[] | select(.dataType=="post")] | if length==0 then "(no posts found)" else (.[] | "- [\(.communityName // "")] \(.title)\n  \(.url)  up:\(.upVotes // 0) comments:\(.numberOfComments // 0)") end) else "apify error: \(.error.message // .)" end' ;;
 
-  x-apify|twitter-apify) # public X search/timelines through Xquik X Tweet Scraper
-    [ $# -ge 1 ] || { echo "usage: reach x-apify <query>  |  reach x-apify user <handle>" >&2; exit 2; }
+  x-public|x-apify|twitter-apify) # reach x-public <query> | reach x-public user <handle>
+    # Public X data through an Apify Actor: no cookies, no account risk. The
+    # Actor is configurable rather than hardcoded — Actors get deprecated,
+    # repriced and replaced, and the route should outlive any one vendor.
+    [ $# -ge 1 ] || { echo "usage: reach x-public <query>  |  reach x-public user <handle>" >&2; exit 2; }
     lim="$(_apify_limit)" || exit $?
     if [ "$1" = user ]; then
-      [ $# -eq 2 ] || { echo "usage: reach x-apify user <handle>" >&2; exit 2; }
+      [ $# -eq 2 ] || { echo "usage: reach x-public user <handle>" >&2; exit 2; }
       handle="${2#@}"
       input="$(jq -n --arg h "$handle" --argjson n "$lim" \
         '{mode:"profileTweets", twitterHandles:[$h], maxItems:$n, maxItemsPerTarget:$n, outputVariant:"rich", fieldStyle:"camelCase", outputPreset:"flat"}')"
@@ -171,10 +174,10 @@ for it in items[:15]:
       input="$(jq -n --arg q "$q" --argjson n "$lim" \
         '{mode:"search", searchTerms:[$q], maxItems:$n, maxItemsPerTarget:$n, outputVariant:"rich", fieldStyle:"camelCase", outputPreset:"flat", includeSearchTerms:true}')"
     fi
-    _apify_items "xquik~x-tweet-scraper" "$input" \
+    _apify_items "${REACH_X_TWEET_ACTOR:-xquik~x-tweet-scraper}" "$input" \
       | jq -c 'if type=="array" then .[] else . end' ;;
 
-  x-followers|twitter-followers) # public follower relations through Xquik X Follower Scraper
+  x-followers|twitter-followers) # reach x-followers <handle> [followers|following|verified_followers]
     [ $# -ge 1 ] && [ $# -le 2 ] || {
       echo "usage: reach x-followers <handle> [followers|following|verified_followers]" >&2
       exit 2
@@ -188,7 +191,7 @@ for it in items[:15]:
     lim="$(_apify_limit)" || exit $?
     input="$(jq -n --arg h "$handle" --arg r "$relation" --argjson n "$lim" \
       '{twitterHandles:[$h], relation:$r, maxItems:$n, maxItemsPerTarget:$n, outputMode:"compact", overlapMode:false, includeTargetMetadata:true}')"
-    _apify_items "xquik~x-follower-scraper" "$input" \
+    _apify_items "${REACH_X_FOLLOWER_ACTOR:-xquik~x-follower-scraper}" "$input" \
       | jq -c 'if type=="array" then .[] else . end' ;;
 
   doc) # reach doc <file.docx|pptx|xlsx|pdf|epub|odt|rtf|csv>   (anydoc, local, keyless)
@@ -275,10 +278,10 @@ except Exception as exc:
     if [ -n "${APIFY_TOKEN:-}" ]; then ok instagram "reach instagram <user>  (Apify, no cookies)"; else no instagram "set APIFY_TOKEN in $KEYS"; fi
     if [ -n "${APIFY_TOKEN:-}" ]; then ok reddit "reach reddit <sub>  (Apify, no app/cookies)"; else no reddit "set APIFY_TOKEN in $KEYS"; fi
     if [ -n "${APIFY_TOKEN:-}" ]; then
-      ok x-apify "reach x-apify <query>  (Xquik Actor, public data)"
-      ok x-followers "reach x-followers <handle>  (Xquik Actor, public data)"
+      ok x-public "reach x-public <query>  (Apify Actor, public data)"
+      ok x-followers "reach x-followers <handle>  (Apify Actor, public data)"
     else
-      no x-apify "set APIFY_TOKEN in $KEYS"
+      no x-public "set APIFY_TOKEN in $KEYS"
       no x-followers "set APIFY_TOKEN in $KEYS"
     fi
     if command -v uv >/dev/null; then ok doc "reach doc <file>  (anydoc, local, no key)"; else no doc "install uv for reach doc"; fi
@@ -301,9 +304,9 @@ reach | server-less internet fetch (direct APIs + CLIs, no MCP, no RAM)
   reach repo <org/repo>      GitHub metadata + README (gh)
   reach instagram <user>     Instagram posts (Apify actor, needs APIFY_TOKEN)
   reach reddit <query>       Reddit search (Apify, no app); scope with: reach reddit r/<sub> <query>
-  reach x-apify <query>      Public X search via Xquik X Tweet Scraper
-  reach x-apify user <handle> Public X timeline via Xquik X Tweet Scraper
-  reach x-followers <handle> Public follower relations via Xquik X Follower Scraper
+  reach x-public <query>     Public X search   (Apify Actor, no cookies)
+  reach x-public user <handle> Public X timeline (Apify Actor, no cookies)
+  reach x-followers <handle> Public follower relations (Apify Actor)
   reach doc <file>           Word/PPT/Excel/PDF/EPUB/ODF -> markdown (local, keyless)
   reach transcribe <audio>   audio/podcast -> text (Groq Whisper, needs GROQ_API_KEY)
   reach x <query>            X/Twitter    (routes to agent-reach, needs burner setup)

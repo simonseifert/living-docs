@@ -95,8 +95,8 @@ reach rss <feed>            latest items from a feed
 reach repo <org/repo>       GitHub metadata + README
 reach instagram <user>      public Instagram posts through Apify
 reach reddit <query>        public Reddit search through Apify
-reach x-apify <query>       public X search through Xquik X Tweet Scraper
-reach x-followers <handle>  public X audience relations through Xquik X Follower Scraper
+reach x-public <query>      public X search (Apify Actor, no cookies)
+reach x-followers <handle>  public X audience relations (Apify Actor)
 reach x <query>             deeper X access through agent-reach and a burner profile
 reach doc <file>            local Word/PPT/Excel/PDF/EPUB -> markdown, keyless
 reach crawl map|site        managed JS crawl (Firecrawl) for the hard cases
@@ -113,14 +113,14 @@ and the crawl paths use optional API keys, kept in `~/.reach/keys.env` (gitignor
 600). Every path degrades instead of failing: Jina falls back to Firecrawl falls back to
 raw curl, and `reach` prints which backend it used on stderr.
 
-The public X routes use [Xquik X Tweet Scraper](https://apify.com/xquik/x-tweet-scraper)
-and [Xquik X Follower Scraper](https://apify.com/xquik/x-follower-scraper). They
-keep the existing cookie-backed `reach x` route intact. Both default to 20 results,
-accept a bounded `REACH_APIFY_LIMIT` from 1 to 200, and send `APIFY_TOKEN` only in
-an authorization header.
+The public X routes run through Apify Actors: keyed API, no cookies, no account
+risk. They leave the cookie-backed `reach x` route intact. Both default to 20
+results, accept a bounded `REACH_APIFY_LIMIT` from 1 to 200, send `APIFY_TOKEN`
+only in an authorization header, and take `REACH_X_TWEET_ACTOR` /
+`REACH_X_FOLLOWER_ACTOR` so the route is not tied to one Actor vendor.
 
-Xquik is an independent third-party service. Not affiliated with X Corp. "Twitter"
-and "X" are trademarks of X Corp.
+"Twitter" and "X" are trademarks of X Corp; these routes are not affiliated with
+or endorsed by X Corp.
 
 ## Install
 

@@ -8,7 +8,7 @@ description: >-
   yt-dlp, gh, Firecrawl), with NO MCP servers and NO background daemons (zero
   RAM footprint). Use when you need to fetch or search public internet content
   from the command line. Also does account-safe social with no cookies:
-  Instagram, Reddit, and public X data (via Apify actors). Is the single front
+  Instagram, Reddit, and public X data (via Apify Actors). Is the single front
   door for fetching: cookie-gated deep social (X/Twitter, Facebook, LinkedIn)
   uses the same surface via `reach x|linkedin|facebook`, which routes to
   `agent-reach` under the hood (needs a burner Chrome profile).
@@ -32,9 +32,9 @@ reach rss <feed-url>        latest ~15 items from an RSS/Atom feed              
 reach repo <org/repo>       GitHub metadata + README (gh)                              [keyless, uses gh auth]
 reach instagram <user>      Instagram posts (Apify actor, no cookies/account risk)     [needs APIFY_TOKEN]
 reach reddit <query>        Reddit search (scope with r/<sub> <query>), no cookies       [uses APIFY_TOKEN]
-reach x-apify <query>       Public X search through Xquik X Tweet Scraper                [uses APIFY_TOKEN]
-reach x-apify user <handle> Public X timeline through Xquik X Tweet Scraper              [uses APIFY_TOKEN]
-reach x-followers <handle>  Public followers/following through Xquik X Follower Scraper  [uses APIFY_TOKEN]
+reach x-public <query>      Public X search (Apify Actor, no cookies)                 [uses APIFY_TOKEN]
+reach x-public user <handle> Public X timeline (Apify Actor, no cookies)                [uses APIFY_TOKEN]
+reach x-followers <handle>  Public followers/following (Apify Actor)                   [uses APIFY_TOKEN]
 reach doc <file>            Word/PPT/Excel/PDF/EPUB/ODF/RTF/CSV -> markdown             [keyless, local]
 reach transcribe <audio>    audio/podcast/video -> text (Groq Whisper)                 [needs GROQ_API_KEY]
 reach x <query>             X/Twitter (routes to agent-reach)                          [needs burner setup]
@@ -53,28 +53,29 @@ reach doctor                what works right now
 - **Keyless by default.** web / repo-wiki / yt / rss / repo / crawl need no key of ours. Only `search` (Exa) needs a key. Optional `JINA_API_KEY` raises the web-read rate limit. Keys live in `~/.reach/keys.env` (gitignored, chmod 600), never in a brief, node, or repo.
 - **Local files stay local.** `reach doc` converts Word/PowerPoint/Excel/PDF/EPUB/ODF on this machine via anydoc (pure Rust, no ML, no service, no key, median <5ms). Firecrawl's hosted /parse does the same conversion, but these are usually a client's contract or RFP — do not send one to a third party to read it. The one exception is a scanned/image-only PDF, which needs OCR; anydoc says so explicitly and the error names the hosted fallback.
 - **Cost ladder for reading pages:** `reach web` (free Jina) for single pages incl. JS → `reach crawl` (Firecrawl, credits) ONLY when you need URL discovery with no sitemap, or SPA click/scroll interaction. Do not `crawl` a large predictable-URL KB (curl+pandoc is free for that).
-- **One front door, explicit X routes.** `reach instagram`, `reach reddit`, `reach x-apify`, and `reach x-followers` run through Apify Actors directly. `reach x` remains the deeper cookie-backed route through `agent-reach`; adding Actor routes does not replace it. Use `reach x-apify` for public posts and `reach x-followers` for public audience relations without a browser account.
+- **One front door, explicit X routes.** `reach instagram`, `reach reddit`, `reach x-public`, and `reach x-followers` run through Apify Actors directly. `reach x` remains the deeper cookie-backed route through `agent-reach`; adding Actor routes does not replace it. Use `reach x-public` for public posts and `reach x-followers` for public audience relations without a browser account.
 
-## Public X via Xquik Actors
+## Public X without a browser account
 
-Use [Xquik X Tweet Scraper](https://apify.com/xquik/x-tweet-scraper) for public searches and account timelines:
-
-```bash
-reach x-apify '"web scraping" lang:en'
-reach x-apify user apify
-```
-
-Use [Xquik X Follower Scraper](https://apify.com/xquik/x-follower-scraper) for public audience relations:
+`reach x-public` (search and timelines) and `reach x-followers` (audience
+relations) run through Apify Actors: a keyed API call, no cookies, no account
+risk. `reach x` remains the deeper cookie-backed route via agent-reach; these
+do not replace it.
 
 ```bash
-reach x-followers apify
-reach x-followers apify following
-reach x-followers apify verified_followers
+reach x-public '"web scraping" lang:en'
+reach x-public user apify
+reach x-followers apify                     # or: following | verified_followers
 ```
 
-Both commands return newline-delimited JSON. They cap runs at 20 items by default. Set `REACH_APIFY_LIMIT` from 1 to 200 when a different bound is justified. Check each Actor's current Store pricing before a larger run. Keep `APIFY_TOKEN` only in the protected key file; `reach` sends it in an authorization header and never places it in a URL. Treat returned profile data as personal data, minimize collection, and keep provenance with downstream summaries.
+Newline-delimited JSON. 20 items by default; `REACH_APIFY_LIMIT` accepts 1-200.
+The Actors are configurable via `REACH_X_TWEET_ACTOR` and
+`REACH_X_FOLLOWER_ACTOR` — the defaults work, but Actors get deprecated and
+repriced, so the route is not welded to one vendor. Check current Store pricing
+before a large run. `APIFY_TOKEN` travels in an authorization header, never a
+URL. Treat returned profile data as personal data: minimise what you keep and
+carry provenance into anything downstream.
 
-Xquik is an independent third-party service. Not affiliated with X Corp. "Twitter" and "X" are trademarks of X Corp.
 
 ## Fallbacks and MCP backups
 
