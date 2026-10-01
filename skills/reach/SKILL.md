@@ -9,8 +9,8 @@ description: >-
   RAM footprint). Use when you need to fetch or search public internet content
   from the command line. Also does account-safe social with no cookies:
   Instagram, Reddit, and public X data (via Apify Actors). Is the single front
-  door for fetching: cookie-gated deep social (X/Twitter, Facebook, LinkedIn)
-  uses the same surface via `reach x|linkedin|facebook`, which routes to
+  door for fetching: LinkedIn and public X run cookie-free through Apify Actors;
+  cookie-gated deep social (Facebook, and X with a session) routes to
   `agent-reach` under the hood (needs a burner Chrome profile).
 trigger: /reach
 ---
@@ -26,7 +26,8 @@ Command: `reach` (on PATH via `~/.local/bin/reach`; source at `~/.claude/skills/
 ```
 reach web <url>             clean markdown of any page (JS-rendered) via Jina Reader   [keyless]
 reach repo-wiki <org/repo>  DeepWiki repo explainer (how a codebase actually works)    [keyless]
-reach search <query>        web search via Exa API                                     [needs EXA_API_KEY]
+reach search <query>        web search: Exa -> SearXNG -> Jina                         [EXA_API_KEY / SEARXNG_URL optional]
+reach psearch <query>       Perplexity Search API, cited results                       [needs PERPLEXITY_API_KEY]
 reach yt <url>              YouTube metadata + auto transcript (yt-dlp)                 [keyless]
 reach rss <feed-url>        latest ~15 items from an RSS/Atom feed                      [keyless]
 reach repo <org/repo>       GitHub metadata + README (gh)                              [keyless, uses gh auth]
@@ -36,21 +37,22 @@ reach x-public <query>      Public X search (Apify Actor, no cookies)           
 reach x-public user <handle> Public X timeline (Apify Actor, no cookies)                [uses APIFY_TOKEN]
 reach x-followers <handle>  Public followers/following (Apify Actor)                   [uses APIFY_TOKEN]
 reach doc <file>            Word/PPT/Excel/PDF/EPUB/ODF/RTF/CSV -> markdown             [keyless, local]
-reach transcribe <audio>    audio/podcast/video -> text (Groq Whisper)                 [needs GROQ_API_KEY]
+reach transcribe <audio>    audio/podcast/video -> text (self-hosted whisper.cpp, Groq fallback) [WHISPER_SERVER_URL / GROQ_API_KEY]
 reach x <query>             X/Twitter (routes to agent-reach)                          [needs burner setup]
-reach linkedin <url|query>  LinkedIn (routes to agent-reach)                           [needs burner setup]
+reach linkedin <url>        LinkedIn profile or company (Apify, no cookies)            [APIFY_TOKEN]
+reach linkedin posts <url>  LinkedIn post history w/ engagement (Apify, no cookies)    [APIFY_TOKEN]
 reach facebook <query>      Facebook (routes to agent-reach)                           [needs burner setup]
 reach crawl map <domain>    discover a site's URLs (Firecrawl)                         [uses credits]
 reach crawl site <url>      managed JS crawl to markdown (Firecrawl)                   [uses credits]
 reach doctor                what works right now
 ```
 
-`reach` is the **single front door**: each command auto-picks its backend, and the cookie-gated platforms (`x`/`linkedin`/`facebook`) route to `agent-reach` under the hood, so callers never choose a tool. Until a burner Chrome profile + logins are set up, those three print the exact enable step instead of failing silently.
+`reach` is the **single front door**: each command auto-picks its backend, so callers never choose a tool. `linkedin` and `x-public` run through Apify Actors with no cookie and no account, so they cannot get an account restricted. The remaining cookie-gated platforms (`facebook`, and `x` for logged-in depth) route to `agent-reach`; until a burner Chrome profile + logins exist, those print the exact enable step instead of failing silently.
 
 ## Design rules
 
 - **Direct API / CLI over MCP servers.** Local MCP servers cost RAM; remote MCP servers cost always-loaded context. A stateless curl/CLI call costs neither. Only reach for an MCP when a source has no usable direct endpoint (e.g. grep.app blocks direct calls; use its remote MCP if you need it).
-- **Keyless by default.** web / repo-wiki / yt / rss / repo / crawl need no key of ours. Only `search` (Exa) needs a key. Optional `JINA_API_KEY` raises the web-read rate limit. Keys live in `~/.reach/keys.env` (gitignored, chmod 600), never in a brief, node, or repo.
+- **Keyless by default.** web / repo-wiki / yt / rss / repo / crawl need no key of ours. `search` uses Exa if keyed, else a self-hosted SearXNG (`SEARXNG_URL`), else keyless Jina. Optional `JINA_API_KEY` raises the web-read rate limit. Keys live in `~/.reach/keys.env` (gitignored, chmod 600), never in a brief, node, or repo.
 - **Local files stay local.** `reach doc` converts Word/PowerPoint/Excel/PDF/EPUB/ODF on this machine via anydoc (pure Rust, no ML, no service, no key, median <5ms). Firecrawl's hosted /parse does the same conversion, but these are usually a client's contract or RFP — do not send one to a third party to read it. The one exception is a scanned/image-only PDF, which needs OCR; anydoc says so explicitly and the error names the hosted fallback.
 - **Cost ladder for reading pages:** `reach web` (free Jina) for single pages incl. JS → `reach crawl` (Firecrawl, credits) ONLY when you need URL discovery with no sitemap, or SPA click/scroll interaction. Do not `crawl` a large predictable-URL KB (curl+pandoc is free for that).
 - **One front door, explicit X routes.** `reach instagram`, `reach reddit`, `reach x-public`, and `reach x-followers` run through Apify Actors directly. `reach x` remains the deeper cookie-backed route through `agent-reach`; adding Actor routes does not replace it. Use `reach x-public` for public posts and `reach x-followers` for public audience relations without a browser account.
@@ -82,7 +84,8 @@ carry provenance into anything downstream.
 Every path degrades instead of failing (the multi-backend idea, borrowed from agent-reach):
 
 - `reach web`: Jina Reader -> Firecrawl scrape (JS, 1 credit) -> raw `curl` + pandoc (no JS). Automatic; it prints which fallback it used on stderr.
-- `reach search`: Exa API -> Jina search (`s.jina.ai`). Automatic.
+- `reach search`: Exa API -> self-hosted SearXNG (`SEARXNG_URL`) -> Jina search (`s.jina.ai`). Automatic.
+- `reach transcribe`: self-hosted whisper.cpp server (`WHISPER_SERVER_URL`, started with `--convert`) -> Groq Whisper. Automatic. Both URL settings take a comma-separated list, e.g. a loopback address and a VPN address for the same box.
 - `reach repo-wiki`: Jina reads DeepWiki; if it fails, use the DeepWiki MCP (`ask_question` also lets you query the repo, which the flat read cannot).
 
 Free remote MCPs are registered as backups / gap-fillers (remote = no local RAM, fine per the "MCP is ok for backup" rule):

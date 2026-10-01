@@ -88,7 +88,8 @@ is the fetch layer `/docs` runs on, and it stands alone as a CLI.
 
 ```
 reach web <url>             clean markdown of any page (JS-rendered), via Jina Reader
-reach search <query>        web search (Exa, with a Jina fallback)
+reach search <query>        web search (Exa, then self-hosted SearXNG, then Jina)
+reach psearch <query>       Perplexity Search API with citations
 reach repo-wiki <org/repo>  DeepWiki explainer of how a codebase actually works
 reach yt <url>              YouTube metadata + transcript
 reach rss <feed>            latest items from a feed
@@ -98,7 +99,9 @@ reach reddit <query>        public Reddit search through Apify
 reach x-public <query>      public X search (Apify Actor, no cookies)
 reach x-followers <handle>  public X audience relations (Apify Actor)
 reach x <query>             deeper X access through agent-reach and a burner profile
+reach linkedin <url>        LinkedIn profile, company or posts (Apify, no cookies)
 reach doc <file>            local Word/PPT/Excel/PDF/EPUB -> markdown, keyless
+reach transcribe <audio>    audio/video -> text (self-hosted whisper.cpp, Groq fallback)
 reach crawl map|site        managed JS crawl (Firecrawl) for the hard cases
 reach doctor                what works right now
 ```

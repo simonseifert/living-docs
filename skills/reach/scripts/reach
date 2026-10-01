@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # reach | a thin, server-less internet-fetch router.
 # Direct HTTP APIs + already-installed CLIs. No MCP servers, no daemons, no RAM footprint.
-# Keys (optional) live in ~/.reach/keys.env (gitignored): EXA_API_KEY, JINA_API_KEY, APIFY_TOKEN.
+# Keys and endpoints (all optional) live in ~/.reach/keys.env, outside the repo:
+#   EXA_API_KEY JINA_API_KEY FIRECRAWL_API_KEY APIFY_TOKEN GROQ_API_KEY PERPLEXITY_API_KEY
+#   SEARXNG_URL (self-hosted search)  WHISPER_SERVER_URL (self-hosted whisper.cpp server)
 # Cookie-backed social still routes through `agent-reach`; public Actor routes run directly.
 set -uo pipefail
 
@@ -15,7 +17,12 @@ _norm() { case "$1" in http://*|https://*) printf '%s' "$1" ;; *) printf 'https:
 _jina() { # clean markdown of any URL (server-side JS render), keyless; key raises rate limit
   local url; url="$(_norm "$1")"
   local h=(-H "User-Agent: $UA")
-  [ -n "${JINA_API_KEY:-}" ] && h+=(-H "Authorization: Bearer $JINA_API_KEY")
+  local out
+  if [ -n "${JINA_API_KEY:-}" ]; then
+    out="$(curl -s --max-time 45 "${h[@]}" -H "Authorization: Bearer $JINA_API_KEY" "https://r.jina.ai/$url")"
+    # empty-balance key (402) blocks even free reads, so retry keyless
+    case "$out" in *InsufficientBalanceError*) ;; *) printf '%s' "$out"; return ;; esac
+  fi
   curl -s --max-time 45 "${h[@]}" "https://r.jina.ai/$url"
 }
 
@@ -67,7 +74,21 @@ case "$cmd" in
       printf '%s\n' "$out"
     else
       echo "reach: jina failed, falling back to firecrawl (1 credit)" >&2
-      fc="$(firecrawl scrape "$(_norm "$1")" -f markdown 2>/dev/null | grep -v '^Scrape ID:')"
+      if command -v firecrawl >/dev/null 2>&1; then
+        fc="$(firecrawl scrape "$(_norm "$1")" -f markdown 2>/dev/null | grep -v '^Scrape ID:')"
+      else
+        # no firecrawl CLI installed -> call the v2 API directly
+        fc="$(curl -s --max-time 60 -X POST "https://api.firecrawl.dev/v2/scrape" \
+              -H "Authorization: Bearer ${FIRECRAWL_API_KEY}" \
+              -H "Content-Type: application/json" \
+              -d "$(printf '{"url":%s,"formats":["markdown"]}' "$(printf '%s' "$(_norm "$1")" | python3 -c 'import json,sys;print(json.dumps(sys.stdin.read().strip()))')")" \
+              | python3 -c 'import json,sys
+try:
+    d=json.load(sys.stdin)
+    print(d.get("data",{}).get("markdown","") or "")
+except Exception:
+    pass')"
+      fi
       if [ -n "$fc" ]; then printf '%s\n' "$fc"
       else
         echo "reach: firecrawl failed too, raw curl+pandoc (no JS render)" >&2
@@ -79,7 +100,7 @@ case "$cmd" in
     [ $# -ge 1 ] || { echo "usage: reach repo-wiki <org/repo>" >&2; exit 2; }
     _jina "https://deepwiki.com/$1" ;;
 
-  search) # reach search <query...>   (Exa -> Jina search fallback)
+  search) # reach search <query...>   (Exa -> SearXNG -> Jina search fallback)
     q="$*"
     [ -n "$q" ] || { echo "usage: reach search <query>" >&2; exit 2; }
     if [ -n "${EXA_API_KEY:-}" ]; then
@@ -88,13 +109,28 @@ case "$cmd" in
         -d "$(jq -n --arg q "$q" '{query:$q, numResults:8, type:"auto", contents:{text:{maxCharacters:500}}}')" \
         | jq -r 'if .results then .results[] | "- \(.title)\n  \(.url)\n  \((.text // "") | gsub("\\s+";" ") | .[0:220])" else empty end')"
       if [ -n "$res" ]; then printf '%s\n' "$res"; exit 0; fi
-      echo "reach: exa returned nothing, falling back to Jina search" >&2
-    else
-      echo "reach: no EXA_API_KEY, using Jina search" >&2
+      echo "reach: exa returned nothing, trying SearXNG" >&2
     fi
+    # Self-hosted SearXNG (free, no key) when SEARXNG_URL is set. Comma-separate
+    # several, e.g. a loopback address and a VPN address for the same instance.
+    sxs="${SEARXNG_URL:-}"; for sx in ${sxs//,/ }; do
+      res="$(curl -s --max-time 25 "$sx/search?q=$(printf '%s' "$q" | jq -sRr @uri)&format=json" 2>/dev/null \
+        | jq -r '.results[:10][]? | "- \(.title)\n  \(.url)\n  \((.content // "") | gsub("\\s+";" ") | .[0:220])"' 2>/dev/null)"
+      if [ -n "$res" ]; then printf '%s\n' "$res"; exit 0; fi
+    done
+    [ -n "${SEARXNG_URL:-}" ] && echo "reach: SearXNG unavailable, falling back to Jina search" >&2
     h=(-H "User-Agent: $UA" -H "Accept: text/plain" -H "X-Respond-With: no-content")
     [ -n "${JINA_API_KEY:-}" ] && h+=(-H "Authorization: Bearer $JINA_API_KEY")
     curl -s --max-time 30 "${h[@]}" "https://s.jina.ai/$(printf '%s' "$q" | jq -sRr @uri)" | sed -n '1,60p' ;;
+
+  psearch) # reach psearch <query...>   (Perplexity Search API — indexed, cited results)
+    q="$*"
+    [ -n "$q" ] || { echo "usage: reach psearch <query>" >&2; exit 2; }
+    [ -n "${PERPLEXITY_API_KEY:-}" ] || { echo "reach: no PERPLEXITY_API_KEY set" >&2; exit 2; }
+    curl -s --max-time 30 -X POST "https://api.perplexity.ai/search" \
+      -H "Authorization: Bearer $PERPLEXITY_API_KEY" -H "Content-Type: application/json" \
+      -d "$(jq -n --arg q "$q" '{query:$q, max_results:8, search_context_size:"high"}')" \
+      | jq -r 'if .results then .results[] | "- \(.title)\n  \(.url)\n  \((.snippet // .content // "") | gsub("\\s+";" ") | .[0:220])" else . end' ;;
 
   yt) # reach yt <url>   (metadata + auto transcript via yt-dlp, keyless)
     [ $# -ge 1 ] || { echo "usage: reach yt <url>" >&2; exit 2; }
@@ -218,15 +254,26 @@ except Exception as exc:
     sys.exit(1)
 ' "$1" ;;
 
-  transcribe) # reach transcribe <audio-url|file>   (Groq Whisper, free key)
+  transcribe) # reach transcribe <audio-url|file>   (self-hosted whisper.cpp, Groq fallback)
     [ $# -ge 1 ] || { echo "usage: reach transcribe <audio-url-or-file>" >&2; exit 2; }
-    [ -n "${GROQ_API_KEY:-}" ] || { echo "reach: GROQ_API_KEY not set in $KEYS (free at https://console.groq.com/keys)" >&2; exit 3; }
     src="$1"; tmp="$(mktemp -d)"; f="$src"
     case "$src" in
       http*) yt-dlp -q --no-warnings -x --audio-format mp3 -o "$tmp/a.%(ext)s" "$src" 2>/dev/null || curl -s -L --max-time 180 -A "$UA" "$src" -o "$tmp/a.mp3"
              f="$(find "$tmp" -maxdepth 1 -type f -name 'a.*' -print -quit)" ;;
     esac
     [ -f "$f" ] || { echo "reach: could not obtain audio from $src" >&2; rm -rf "$tmp"; exit 1; }
+    # Self-hosted first: a whisper.cpp server (started with --convert so it takes
+    # any audio format) at WHISPER_SERVER_URL, comma-separated for several. No
+    # key, no upload limit, no expiry. Groq is the fallback.
+    wss="${WHISPER_SERVER_URL:-}"; for url in ${wss//,/ }; do
+      url="${url%/}"
+      curl -s -o /dev/null --max-time 3 "$url/" || continue
+      if out="$(curl -sf --max-time 3600 "$url/inference" -F "file=@$f" -F response_format=text -F language=auto)" && [ -n "$out" ]; then
+        printf '%s\n' "$out"; rm -rf "$tmp"; exit 0
+      fi
+      echo "reach: local whisper at $url failed, trying the next option" >&2
+    done
+    [ -n "${GROQ_API_KEY:-}" ] || { echo "reach: no reachable WHISPER_SERVER_URL and no GROQ_API_KEY in $KEYS (free at https://console.groq.com/keys)" >&2; rm -rf "$tmp"; exit 3; }
     curl -s --max-time 300 "https://api.groq.com/openai/v1/audio/transcriptions" \
       -H "Authorization: Bearer $GROQ_API_KEY" \
       -F "file=@$f" -F "model=whisper-large-v3-turbo" -F "response_format=text"
@@ -238,11 +285,30 @@ except Exception as exc:
     if [ "$1" = user ]; then shift; twitter-cli user "$1" 2>/dev/null || opencli twitter user "$1" -f yaml
     else twitter-cli search "$*" 2>/dev/null || opencli twitter search "$*" -f yaml; fi ;;
 
-  linkedin) # reach linkedin <profile-url>  |  reach linkedin <search query>   (routes to agent-reach)
-    [ $# -ge 1 ] || { echo "usage: reach linkedin <profile-url>  |  reach linkedin <search query>" >&2; exit 2; }
-    b="$(_ar_backend linkedin)"; [ "$b" = none ] && _need_social linkedin "agent-reach install --channels linkedin"
-    case "$1" in http*) mcporter call "linkedin-scraper.get_person_profile(linkedin_url: \"$1\")" ;;
-                 *) mcporter call "linkedin-scraper.search_people(keyword: \"$*\", limit: 10)" ;; esac ;;
+  linkedin) # reach linkedin <profile-url> | reach linkedin posts <profile-url>   (Apify Actor, no cookies)
+    # Was routed to agent-reach's linkedin-scraper MCP, which has been unconfigured
+    # (backend "off") and therefore silently dead. HarvestAPI's Actors need no cookie
+    # and no account, so nothing here can get a LinkedIn account restricted.
+    #
+    # Input keys come from the Actor's own schema, not from guessing -- a wrong key
+    # makes the run SUCCEED with an empty dataset instead of erroring:
+    #   GET /v2/acts/<actor>/builds/default/openapi.json
+    [ $# -ge 1 ] || { echo "usage: reach linkedin <profile-url> | reach linkedin posts <profile-url>" >&2; exit 2; }
+    lim="$(_apify_limit)" || exit $?
+    if [ "$1" = posts ]; then
+      [ $# -eq 2 ] || { echo "usage: reach linkedin posts <profile-url>" >&2; exit 2; }
+      input="$(jq -n --arg u "$2" --argjson n "$lim" \
+        '{targetUrls:[$u], maxPosts:$n, scrapeReactions:false, scrapeComments:false}')"
+      _apify_items "harvestapi~linkedin-profile-posts" "$input" | jq -c '.[]'
+    else
+      case "$1" in
+        *"/company/"*) input="$(jq -n --arg u "$1" '{companies:[$u]}')"
+                       _apify_items "harvestapi~linkedin-company" "$input" | jq -c '.[]' ;;
+        http*)         input="$(jq -n --arg u "$1" '{urls:[$u]}')"
+                       _apify_items "harvestapi~linkedin-profile-scraper" "$input" | jq -c '.[]' ;;
+        *)             echo "reach: pass a full profile/company URL, or 'posts <url>'" >&2; exit 2 ;;
+      esac
+    fi ;;
 
   facebook|fb) # reach facebook <query>   (routes to agent-reach)
     [ $# -ge 1 ] || { echo "usage: reach facebook <query>" >&2; exit 2; }
@@ -270,11 +336,16 @@ except Exception as exc:
     fi
     ok "repo-wiki" "reach repo-wiki <org/repo>  (DeepWiki via jina)"
     if [ -n "${EXA_API_KEY:-}" ]; then ok "search (exa)" "key set"; else no "search (exa)" "set EXA_API_KEY in $KEYS"; fi
+    sx_ok=""; sxs="${SEARXNG_URL:-}"; for sx in ${sxs//,/ }; do curl -s -o /dev/null --max-time 3 "$sx/" && { sx_ok="$sx"; break; }; done
+    if [ -n "$sx_ok" ]; then ok "search (searxng)" "$sx_ok"; else no "search (searxng)" "optional: set SEARXNG_URL in $KEYS"; fi
+    if [ -n "${PERPLEXITY_API_KEY:-}" ]; then ok psearch "reach psearch <query>  (Perplexity)"; else no psearch "optional: set PERPLEXITY_API_KEY in $KEYS"; fi
     if command -v yt-dlp >/dev/null; then ok yt "reach yt <url>  ($(yt-dlp --version 2>/dev/null))"; else no yt "pipx install yt-dlp"; fi
     if command -v gh >/dev/null && gh auth status >/dev/null 2>&1; then ok gh "reach repo <org/repo>  (authed)"; else no gh "gh auth login"; fi
     ok rss "reach rss <feed>"
-    if command -v firecrawl >/dev/null; then ok firecrawl "reach crawl map|site  ($(firecrawl --version 2>/dev/null))"; else no firecrawl "npm i -g firecrawl-cli"; fi
-    if command -v pandoc >/dev/null; then ok pandoc "html->md"; else no pandoc "brew install pandoc"; fi
+    if command -v firecrawl >/dev/null; then ok firecrawl "reach crawl map|site  ($(firecrawl --version 2>/dev/null))"
+    elif [ -n "${FIRECRAWL_API_KEY:-}" ]; then no firecrawl "crawl needs the CLI: npm i -g firecrawl-cli (web fallback uses the API key)"
+    else no firecrawl "npm i -g firecrawl-cli"; fi
+    if command -v pandoc >/dev/null; then ok pandoc "html->md"; else no pandoc "install pandoc (apt install pandoc / brew install pandoc)"; fi
     if [ -n "${APIFY_TOKEN:-}" ]; then ok instagram "reach instagram <user>  (Apify, no cookies)"; else no instagram "set APIFY_TOKEN in $KEYS"; fi
     if [ -n "${APIFY_TOKEN:-}" ]; then ok reddit "reach reddit <sub>  (Apify, no app/cookies)"; else no reddit "set APIFY_TOKEN in $KEYS"; fi
     if [ -n "${APIFY_TOKEN:-}" ]; then
@@ -285,8 +356,12 @@ except Exception as exc:
       no x-followers "set APIFY_TOKEN in $KEYS"
     fi
     if command -v uv >/dev/null; then ok doc "reach doc <file>  (anydoc, local, no key)"; else no doc "install uv for reach doc"; fi
-    if [ -n "${GROQ_API_KEY:-}" ]; then ok transcribe "reach transcribe <audio>  (Groq Whisper)"; else no transcribe "set GROQ_API_KEY in $KEYS (free)"; fi
-    for p in twitter linkedin facebook; do
+    ws_ok=""; wss="${WHISPER_SERVER_URL:-}"; for ws in ${wss//,/ }; do curl -s -o /dev/null --max-time 3 "${ws%/}/" && { ws_ok="${ws%/}"; break; }; done
+    if [ -n "$ws_ok" ]; then ok transcribe "reach transcribe <audio>  (whisper.cpp at $ws_ok, Groq fallback)"
+    elif [ -n "${GROQ_API_KEY:-}" ]; then ok transcribe "reach transcribe <audio>  (Groq Whisper)"
+    else no transcribe "set WHISPER_SERVER_URL or GROQ_API_KEY in $KEYS"; fi
+    if [ -n "${APIFY_TOKEN:-}" ]; then ok linkedin "reach linkedin <url>  (Apify, no cookies)"; else no linkedin "set APIFY_TOKEN in $KEYS"; fi
+    for p in twitter facebook; do
       b="$(_ar_backend "$p")"
       if [ "$b" != none ]; then ok "$p" "reach $p  (via agent-reach: $b)"
       else printf '  \033[33m~\033[0m %-14s %s\n' "$p" "reach $p  (routes to agent-reach; needs burner setup)"; fi
@@ -298,7 +373,8 @@ reach | server-less internet fetch (direct APIs + CLIs, no MCP, no RAM)
 
   reach web <url>            clean markdown of any page (JS-rendered), via Jina Reader
   reach repo-wiki <org/repo> DeepWiki repo explainer (via Jina)
-  reach search <query>       web search via Exa API (needs EXA_API_KEY)
+  reach search <query>       web search: Exa -> SearXNG (SEARXNG_URL) -> Jina
+  reach psearch <query>      Perplexity Search API, cited results (needs PERPLEXITY_API_KEY)
   reach yt <url>             YouTube metadata + auto transcript (yt-dlp)
   reach rss <feed-url>       latest items from an RSS/Atom feed
   reach repo <org/repo>      GitHub metadata + README (gh)
@@ -308,17 +384,20 @@ reach | server-less internet fetch (direct APIs + CLIs, no MCP, no RAM)
   reach x-public user <handle> Public X timeline (Apify Actor, no cookies)
   reach x-followers <handle> Public follower relations (Apify Actor)
   reach doc <file>           Word/PPT/Excel/PDF/EPUB/ODF -> markdown (local, keyless)
-  reach transcribe <audio>   audio/podcast -> text (Groq Whisper, needs GROQ_API_KEY)
+  reach transcribe <audio>   audio/podcast -> text (whisper.cpp at WHISPER_SERVER_URL, Groq fallback)
   reach x <query>            X/Twitter    (routes to agent-reach, needs burner setup)
-  reach linkedin <url|query> LinkedIn     (routes to agent-reach, needs burner setup)
+  reach linkedin <url>       LinkedIn profile/company (Apify, no cookies)
+  reach linkedin posts <url> LinkedIn post history (Apify, no cookies)
   reach facebook <query>     Facebook     (routes to agent-reach, needs burner setup)
   reach crawl map <domain>   discover URLs (Firecrawl, uses credits)
   reach crawl site <url>     managed JS crawl (Firecrawl, uses credits)
   reach doctor               what works right now
 
 reach is the single front door: each command auto-picks its backend; the cookie-gated
-platforms (x/linkedin/facebook) route to agent-reach under the hood.
-Keys: ~/.reach/keys.env  ->  EXA_API_KEY, JINA_API_KEY, FIRECRAWL_API_KEY, APIFY_TOKEN (IG+Reddit+X Actors), GROQ_API_KEY
+platforms (x for logged-in depth, facebook) route to agent-reach under the hood.
+Keys: ~/.reach/keys.env  ->  EXA_API_KEY, JINA_API_KEY, FIRECRAWL_API_KEY, APIFY_TOKEN
+      (IG+Reddit+X+LinkedIn Actors), GROQ_API_KEY, PERPLEXITY_API_KEY
+Self-hosted (optional, comma-separate several): SEARXNG_URL, WHISPER_SERVER_URL
 Set REACH_APIFY_LIMIT=1..200 to change the X Actor result cap. The default is 20.
 EOF
     ;;
