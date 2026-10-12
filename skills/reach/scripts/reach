@@ -64,37 +64,92 @@ _apify_items() { # $1=actor id with ~ separator  $2=input JSON
     -d "$2"
 }
 
+_offer_browser() { # the Chromium tier's browser is missing: ask on a terminal, hint otherwise
+  if [ -t 0 ] && [ -t 2 ]; then
+    printf 'reach: headless Chromium for the local web tier is not installed (~110 MB). Install now? [y/N] ' >&2
+    read -r a; case "$a" in y|Y|yes) "$(dirname "$(readlink -f "$0")")/reach-render.py" install >&2 ;; *) return 1 ;; esac
+  else
+    echo "reach: local Chromium tier unavailable, run 'reach setup' once to install it" >&2; return 1
+  fi
+}
+
 cmd="${1:-help}"; shift 2>/dev/null || true
 
 case "$cmd" in
-  web) # reach web <url>   (Jina -> Firecrawl -> curl+pandoc)
+  web) # reach web <url>   (Jina -> local Chromium -> Firecrawl -> curl+extract)
+    # Free tiers first; each is checked by HTTP status + content, not by grepping
+    # error words. Exits 1 with the reason per backend when nothing worked, so an
+    # empty page is never mistaken for success. REACH_FRESH=1 bypasses Jina's cache,
+    # REACH_NO_BROWSER=1 skips the local Chromium tier.
     [ $# -ge 1 ] || { echo "usage: reach web <url>" >&2; exit 2; }
-    out="$(_jina "$1")"
-    if [ -n "$out" ] && ! printf '%s' "$out" | head -c 400 | grep -qiE 'rate limit|too many requests|"code":[0-9]|error 4[0-9][0-9]'; then
-      printf '%s\n' "$out"
+    url="$(_norm "$1")"; why=(); tmp="$(mktemp)"; trap 'rm -f "$tmp"' EXIT
+    _ok() { # enough text, and not a bot-wall / challenge interstitial
+      [ "$(wc -c <"$tmp")" -gt 120 ] || { why+=("$1: too little text"); return 1; }
+      if head -c 1500 "$tmp" | grep -qiE '^Title: (Just a moment|Attention Required|Access denied|Security check)|Performing security verification|Target URL returned error 40[39]|verify you are (a )?human|cf-chl|captcha-delivery'; then
+        why+=("$1: got a bot-wall / challenge page"); return 1
+      fi
+    }
+    _emit() { cat "$tmp"; echo "reach: served by $1" >&2; exit 0; }
+
+    render="$(dirname "$(readlink -f "$0")")/reach-render.py"
+    # Reddit: Jina blocks anonymous reddit reads and old.reddit is login-walled, but
+    # Chromium on www.reddit.com gets the post plus comments, so go there first.
+    case "$url" in https://*reddit.com/*|https://redd.it/*) skip_jina=1; url="https://www.reddit.com/${url#*reddit.com/}" ;; *) skip_jina="" ;; esac
+
+    # 1) Jina Reader: hosted JS render. An empty-balance key 402s even free reads, so retry keyless.
+    jh=(-H "User-Agent: $UA"); [ "${REACH_FRESH:-}" = 1 ] && jh+=(-H "X-No-Cache: true")
+    code=""; [ -n "$skip_jina" ] && code=skipped
+    if [ -n "${JINA_API_KEY:-}" ]; then
+      code="$(curl -s --max-time 45 -o "$tmp" -w '%{http_code}' "${jh[@]}" -H "Authorization: Bearer $JINA_API_KEY" "https://r.jina.ai/$url")"
+      [ "$code" = 402 ] && why+=("jina key: out of credits (402), retried keyless")
+    fi
+    if [ -z "$code" ] || [ "$code" = 402 ]; then
+      code="$(curl -s --max-time 45 -o "$tmp" -w '%{http_code}' "${jh[@]}" "https://r.jina.ai/$url")"
+    fi
+    # Jina can serve a stale (even wrong) cached snapshot; it flags those, so refetch live once
+    if [ "$code" = 200 ] && [ "${REACH_FRESH:-}" != 1 ] && head -c 600 "$tmp" | grep -q 'cached snapshot of the original page'; then
+      code="$(curl -s --max-time 45 -o "$tmp" -w '%{http_code}' "${jh[@]}" -H "X-No-Cache: true" "https://r.jina.ai/$url")"
+    fi
+    if [ "$code" = 200 ] && _ok jina; then _emit jina; fi
+    [ "$code" = 200 ] || [ "$code" = skipped ] || why+=("jina: HTTP $code $(jq -r '.message // empty' "$tmp" 2>/dev/null | head -c 120)")
+
+    # 2) Local headless Chromium + trafilatura: free, unlimited, renders JS.
+    if [ "${REACH_NO_BROWSER:-}" != 1 ] && command -v uv >/dev/null; then
+      err="$(timeout 90 "$render" render "$url" 2>&1 >"$tmp")"; rc=$?
+      if [ $rc = 3 ] && _offer_browser; then
+        err="$(timeout 90 "$render" render "$url" 2>&1 >"$tmp")"; rc=$?
+      fi
+      if [ $rc = 0 ]; then _ok chromium && _emit chromium
+      else why+=("chromium: ${err:-timed out or empty}"); fi
+    fi
+
+    # 3) Firecrawl API (paid, 1 credit).
+    if [ -n "${FIRECRAWL_API_KEY:-}" ]; then
+      code="$(curl -s --max-time 60 -o "$tmp.fc" -w '%{http_code}' -X POST "https://api.firecrawl.dev/v2/scrape" \
+        -H "Authorization: Bearer $FIRECRAWL_API_KEY" -H "Content-Type: application/json" \
+        -d "$(jq -n --arg u "$url" '{url:$u, formats:["markdown"]}')")"
+      jq -r '.data.markdown // empty' "$tmp.fc" 2>/dev/null >"$tmp"
+      if [ "$code" = 200 ] && _ok firecrawl; then rm -f "$tmp.fc"; _emit firecrawl; fi
+      case "$code" in
+        200) ;; # _ok already logged why it was rejected
+        402) why+=("firecrawl: out of credits (402)") ;;
+        *)   why+=("firecrawl: HTTP $code $(jq -r '.error // empty' "$tmp.fc" 2>/dev/null | head -c 120)") ;;
+      esac
+      rm -f "$tmp.fc"
+    fi
+
+    # 4) Plain HTTP GET + local extraction (no JS).
+    if html="$(curl -sSfL --max-time 25 -A "$UA" "$url" 2>&1)"; then
+      if command -v uv >/dev/null && printf '%s' "$html" | "$render" extract "$url" >"$tmp" 2>/dev/null && _ok curl; then _emit curl+extract; fi
+      if command -v pandoc >/dev/null && printf '%s' "$html" | pandoc -f html -t gfm-raw_html --wrap=none >"$tmp" 2>/dev/null && _ok curl; then _emit curl+pandoc; fi
+      why+=("curl: fetched, but no readable content (JS-only page?)")
     else
-      echo "reach: jina failed, falling back to firecrawl (1 credit)" >&2
-      if command -v firecrawl >/dev/null 2>&1; then
-        fc="$(firecrawl scrape "$(_norm "$1")" -f markdown 2>/dev/null | grep -v '^Scrape ID:')"
-      else
-        # no firecrawl CLI installed -> call the v2 API directly
-        fc="$(curl -s --max-time 60 -X POST "https://api.firecrawl.dev/v2/scrape" \
-              -H "Authorization: Bearer ${FIRECRAWL_API_KEY}" \
-              -H "Content-Type: application/json" \
-              -d "$(printf '{"url":%s,"formats":["markdown"]}' "$(printf '%s' "$(_norm "$1")" | python3 -c 'import json,sys;print(json.dumps(sys.stdin.read().strip()))')")" \
-              | python3 -c 'import json,sys
-try:
-    d=json.load(sys.stdin)
-    print(d.get("data",{}).get("markdown","") or "")
-except Exception:
-    pass')"
-      fi
-      if [ -n "$fc" ]; then printf '%s\n' "$fc"
-      else
-        echo "reach: firecrawl failed too, raw curl+pandoc (no JS render)" >&2
-        curl -s --max-time 25 -A "$UA" "$(_norm "$1")" | pandoc -f html -t gfm-raw_html --wrap=none 2>/dev/null
-      fi
-    fi ;;
+      why+=("curl: ${html:-request failed}")
+    fi
+
+    echo "reach: all backends failed for $url" >&2
+    printf '  - %s\n' "${why[@]}" >&2
+    exit 1 ;;
 
   repo-wiki) # reach repo-wiki <org/repo>  (DeepWiki via Jina, keyless)
     [ $# -ge 1 ] || { echo "usage: reach repo-wiki <org/repo>" >&2; exit 2; }
@@ -323,17 +378,27 @@ except Exception as exc:
       *) echo "usage: reach crawl {map <domain>|site <url>} [flags]   (uses Firecrawl credits; free tier ~1000/mo)" >&2; exit 2 ;;
     esac ;;
 
+  setup) # reach setup   (install the headless Chromium for the local web tier, matched to the pinned Playwright)
+    command -v uv >/dev/null || { echo "reach: install uv first: curl -LsSf https://astral.sh/uv/install.sh | sh" >&2; exit 2; }
+    r="$(dirname "$(readlink -f "$0")")/reach-render.py"
+    "$r" check 2>/dev/null && exit 0
+    "$r" install && "$r" check ;;
+
   doctor) # reach doctor   (what works right now)
     ok(){ printf '  \033[32m✓\033[0m %-14s %s\n' "$1" "$2"; }
     no(){ printf '  \033[31m✗\033[0m %-14s %s\n' "$1" "$2"; }
     echo "reach doctor | server-less internet fetch"
     if command -v curl >/dev/null; then ok curl "any HTTP"; else no curl "missing"; fi
     if [ -n "${JINA_API_KEY:-}" ]; then jina_key="set"; else jina_key="none"; fi
-    if curl -s --max-time 12 -o /dev/null -w '' "https://r.jina.ai/https://example.com" 2>/dev/null; then
-      ok "web (jina)" "reach web <url>  [jina key: $jina_key]"
-    else
-      no "web (jina)" "unreachable"
+    jc="$(curl -s --max-time 12 -o /dev/null -w '%{http_code}' "https://r.jina.ai/https://example.com" 2>/dev/null)"
+    if [ "$jc" = 200 ]; then ok "web (jina)" "reach web <url>  [keyless ok]"; else no "web (jina)" "keyless HTTP ${jc:-timeout}"; fi
+    if [ -n "${JINA_API_KEY:-}" ]; then
+      jc="$(curl -s --max-time 12 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $JINA_API_KEY" "https://r.jina.ai/https://example.com" 2>/dev/null)"
+      case "$jc" in 200) ok "jina key" "has balance" ;; 402) no "jina key" "out of credits (402), top up at jina.ai" ;; *) no "jina key" "HTTP ${jc:-timeout}" ;; esac
     fi
+    if ! command -v uv >/dev/null; then no "web (chromium)" "needs uv, then: reach setup"
+    elif msg="$(timeout 60 "$(dirname "$(readlink -f "$0")")/reach-render.py" check 2>&1)"; then ok "web (chromium)" "local headless fallback (${msg#ok: })"
+    else no "web (chromium)" "${msg##*$'\n'}, run: reach setup"; fi
     ok "repo-wiki" "reach repo-wiki <org/repo>  (DeepWiki via jina)"
     if [ -n "${EXA_API_KEY:-}" ]; then ok "search (exa)" "key set"; else no "search (exa)" "set EXA_API_KEY in $KEYS"; fi
     sx_ok=""; sxs="${SEARXNG_URL:-}"; for sx in ${sxs//,/ }; do curl -s -o /dev/null --max-time 3 "$sx/" && { sx_ok="$sx"; break; }; done
@@ -342,10 +407,12 @@ except Exception as exc:
     if command -v yt-dlp >/dev/null; then ok yt "reach yt <url>  ($(yt-dlp --version 2>/dev/null))"; else no yt "pipx install yt-dlp"; fi
     if command -v gh >/dev/null && gh auth status >/dev/null 2>&1; then ok gh "reach repo <org/repo>  (authed)"; else no gh "gh auth login"; fi
     ok rss "reach rss <feed>"
-    if command -v firecrawl >/dev/null; then ok firecrawl "reach crawl map|site  ($(firecrawl --version 2>/dev/null))"
-    elif [ -n "${FIRECRAWL_API_KEY:-}" ]; then no firecrawl "crawl needs the CLI: npm i -g firecrawl-cli (web fallback uses the API key)"
-    else no firecrawl "npm i -g firecrawl-cli"; fi
-    if command -v pandoc >/dev/null; then ok pandoc "html->md"; else no pandoc "install pandoc (apt install pandoc / brew install pandoc)"; fi
+    if [ -n "${FIRECRAWL_API_KEY:-}" ]; then
+      fcc="$(curl -s --max-time 12 -H "Authorization: Bearer $FIRECRAWL_API_KEY" https://api.firecrawl.dev/v2/team/credit-usage | jq -r '.data.remainingCredits // empty' 2>/dev/null)"
+      if [ -n "$fcc" ] && [ "$fcc" -gt 0 ] 2>/dev/null; then ok firecrawl "web fallback, $fcc credits left"; else no firecrawl "${fcc:-?} credits left, top up at firecrawl.dev"; fi
+    else no firecrawl "optional: set FIRECRAWL_API_KEY in $KEYS"; fi
+    if command -v firecrawl >/dev/null; then ok "crawl" "reach crawl map|site  ($(firecrawl --version 2>/dev/null))"; else no "crawl" "needs the CLI: npm i -g firecrawl-cli"; fi
+    if command -v pandoc >/dev/null; then ok pandoc "html->md"; else no pandoc "optional (web uses trafilatura via uv)"; fi
     if [ -n "${APIFY_TOKEN:-}" ]; then ok instagram "reach instagram <user>  (Apify, no cookies)"; else no instagram "set APIFY_TOKEN in $KEYS"; fi
     if [ -n "${APIFY_TOKEN:-}" ]; then ok reddit "reach reddit <sub>  (Apify, no app/cookies)"; else no reddit "set APIFY_TOKEN in $KEYS"; fi
     if [ -n "${APIFY_TOKEN:-}" ]; then

@@ -87,7 +87,7 @@ already have. No MCP server processes, no background daemons, nothing resident i
 is the fetch layer `/docs` runs on, and it stands alone as a CLI.
 
 ```
-reach web <url>             clean markdown of any page (JS-rendered), via Jina Reader
+reach web <url>             clean markdown of any page (JS-rendered), Jina Reader -> local headless Chromium
 reach search <query>        web search (Exa, then self-hosted SearXNG, then Jina)
 reach psearch <query>       Perplexity Search API with citations
 reach repo-wiki <org/repo>  DeepWiki explainer of how a codebase actually works

@@ -24,7 +24,8 @@ Command: `reach` (on PATH via `~/.local/bin/reach`; source at `~/.claude/skills/
 ## Commands
 
 ```
-reach web <url>             clean markdown of any page (JS-rendered) via Jina Reader   [keyless]
+reach web <url>             clean markdown of any page (JS-rendered): Jina -> local Chromium   [keyless]
+reach setup                 one-time: install headless Chromium for the local web tier
 reach repo-wiki <org/repo>  DeepWiki repo explainer (how a codebase actually works)    [keyless]
 reach search <query>        web search: Exa -> SearXNG -> Jina                         [EXA_API_KEY / SEARXNG_URL optional]
 reach psearch <query>       Perplexity Search API, cited results                       [needs PERPLEXITY_API_KEY]
@@ -54,7 +55,7 @@ reach doctor                what works right now
 - **Direct API / CLI over MCP servers.** Local MCP servers cost RAM; remote MCP servers cost always-loaded context. A stateless curl/CLI call costs neither. Only reach for an MCP when a source has no usable direct endpoint (e.g. grep.app blocks direct calls; use its remote MCP if you need it).
 - **Keyless by default.** web / repo-wiki / yt / rss / repo / crawl need no key of ours. `search` uses Exa if keyed, else a self-hosted SearXNG (`SEARXNG_URL`), else keyless Jina. Optional `JINA_API_KEY` raises the web-read rate limit. Keys live in `~/.reach/keys.env` (gitignored, chmod 600), never in a brief, node, or repo.
 - **Local files stay local.** `reach doc` converts Word/PowerPoint/Excel/PDF/EPUB/ODF on this machine via anydoc (pure Rust, no ML, no service, no key, median <5ms). Firecrawl's hosted /parse does the same conversion, but these are usually a client's contract or RFP — do not send one to a third party to read it. The one exception is a scanned/image-only PDF, which needs OCR; anydoc says so explicitly and the error names the hosted fallback.
-- **Cost ladder for reading pages:** `reach web` (free Jina) for single pages incl. JS → `reach crawl` (Firecrawl, credits) ONLY when you need URL discovery with no sitemap, or SPA click/scroll interaction. Do not `crawl` a large predictable-URL KB (curl+pandoc is free for that).
+- **Cost ladder for reading pages:** `reach web` (free Jina) for single pages incl. JS → `reach crawl` (Firecrawl, credits) ONLY when you need URL discovery with no sitemap, or SPA click/scroll interaction. Do not `crawl` a large predictable-URL KB (`reach web` per URL is free for that).
 - **One front door, explicit X routes.** `reach instagram`, `reach reddit`, `reach x-public`, and `reach x-followers` run through Apify Actors directly. `reach x` remains the deeper cookie-backed route through `agent-reach`; adding Actor routes does not replace it. Use `reach x-public` for public posts and `reach x-followers` for public audience relations without a browser account.
 
 ## Public X without a browser account
@@ -83,7 +84,7 @@ carry provenance into anything downstream.
 
 Every path degrades instead of failing (the multi-backend idea, borrowed from agent-reach):
 
-- `reach web`: Jina Reader -> Firecrawl scrape (JS, 1 credit) -> raw `curl` + pandoc (no JS). Automatic; it prints which fallback it used on stderr.
+- `reach web`: Jina Reader (keyless retry if the key is out of credits; live refetch if Jina serves a stale cached snapshot) -> local headless Chromium + trafilatura (`scripts/reach-render.py`, free, JS, gets past most Cloudflare challenges) -> Firecrawl scrape (1 credit) -> plain `curl` + extraction (no JS). Each tier is accepted only on HTTP 200 with real text that is not a bot-wall page. stderr says `reach: served by <tier>`; if every tier fails it exits 1 and lists the reason per backend (out of credits, DNS, challenge page...). `REACH_FRESH=1` skips Jina's cache, `REACH_NO_BROWSER=1` skips Chromium. Reddit URLs (incl. old.reddit / redd.it) skip Jina, which blocks anonymous Reddit reads, and go straight to Chromium on www.reddit.com, which returns the post plus its comments for free. The Chromium tier needs `uv`; run `reach setup` once per machine to download the headless Chromium matching the pinned Playwright. If it is missing, `reach web` offers to install it on a terminal, prints that hint otherwise, and `reach doctor` reports it.
 - `reach search`: Exa API -> self-hosted SearXNG (`SEARXNG_URL`) -> Jina search (`s.jina.ai`). Automatic.
 - `reach transcribe`: self-hosted whisper.cpp server (`WHISPER_SERVER_URL`, started with `--convert`) -> Groq Whisper. Automatic. Both URL settings take a comma-separated list, e.g. a loopback address and a VPN address for the same box.
 - `reach repo-wiki`: Jina reads DeepWiki; if it fails, use the DeepWiki MCP (`ask_question` also lets you query the repo, which the flat read cannot).
