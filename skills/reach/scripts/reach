@@ -164,7 +164,7 @@ case "$cmd" in
         -d "$(jq -n --arg q "$q" '{query:$q, numResults:8, type:"auto", contents:{text:{maxCharacters:500}}}')" \
         | jq -r 'if .results then .results[] | "- \(.title)\n  \(.url)\n  \((.text // "") | gsub("\\s+";" ") | .[0:220])" else empty end')"
       if [ -n "$res" ]; then printf '%s\n' "$res"; exit 0; fi
-      echo "reach: exa returned nothing, trying SearXNG" >&2
+      echo "reach: exa returned nothing (run \`reach doctor\`: often out of credits), trying SearXNG" >&2
     fi
     # Self-hosted SearXNG (free, no key) when SEARXNG_URL is set. Comma-separate
     # several, e.g. a loopback address and a VPN address for the same instance.
@@ -400,7 +400,14 @@ except Exception as exc:
     elif msg="$(timeout 60 "$(dirname "$(readlink -f "$0")")/reach-render.py" check 2>&1)"; then ok "web (chromium)" "local headless fallback (${msg#ok: })"
     else no "web (chromium)" "${msg##*$'\n'}, run: reach setup"; fi
     ok "repo-wiki" "reach repo-wiki <org/repo>  (DeepWiki via jina)"
-    if [ -n "${EXA_API_KEY:-}" ]; then ok "search (exa)" "key set"; else no "search (exa)" "set EXA_API_KEY in $KEYS"; fi
+    # Probe, don't just check the key exists: an out-of-credit key looked green here
+    # while every search silently fell through to SearXNG. Costs one 1-result search.
+    if [ -n "${EXA_API_KEY:-}" ]; then
+      ex="$(curl -s --max-time 15 -X POST https://api.exa.ai/search -H "x-api-key: $EXA_API_KEY" \
+        -H "Content-Type: application/json" -d '{"query":"example","numResults":1}' 2>/dev/null)"
+      if printf '%s' "$ex" | jq -e '.results' >/dev/null 2>&1; then ok "search (exa)" "key works"
+      else no "search (exa)" "$(printf '%s' "$ex" | jq -r '.error // .message // "no response"' 2>/dev/null | cut -c1-70)"; fi
+    else no "search (exa)" "set EXA_API_KEY in $KEYS"; fi
     sx_ok=""; sxs="${SEARXNG_URL:-}"; for sx in ${sxs//,/ }; do curl -s -o /dev/null --max-time 3 "$sx/" && { sx_ok="$sx"; break; }; done
     if [ -n "$sx_ok" ]; then ok "search (searxng)" "$sx_ok"; else no "search (searxng)" "optional: set SEARXNG_URL in $KEYS"; fi
     if [ -n "${PERPLEXITY_API_KEY:-}" ]; then ok psearch "reach psearch <query>  (Perplexity)"; else no psearch "optional: set PERPLEXITY_API_KEY in $KEYS"; fi
@@ -413,6 +420,14 @@ except Exception as exc:
     else no firecrawl "optional: set FIRECRAWL_API_KEY in $KEYS"; fi
     if command -v firecrawl >/dev/null; then ok "crawl" "reach crawl map|site  ($(firecrawl --version 2>/dev/null))"; else no "crawl" "needs the CLI: npm i -g firecrawl-cli"; fi
     if command -v pandoc >/dev/null; then ok pandoc "html->md"; else no pandoc "optional (web uses trafilatura via uv)"; fi
+    # Apify refuses every run once the monthly cap is hit or an invoice is unpaid, while
+    # the token itself stays valid. /users/me/limits is free to call.
+    apify_bad=""
+    if [ -n "${APIFY_TOKEN:-}" ]; then
+      al="$(curl -s --max-time 12 -H "Authorization: Bearer $APIFY_TOKEN" https://api.apify.com/v2/users/me/limits 2>/dev/null)"
+      apify_bad="$(printf '%s' "$al" | jq -r 'if .data then (if .data.current.monthlyUsageUsd >= .data.limits.maxMonthlyUsageUsd then "over monthly cap: $\(.data.current.monthlyUsageUsd|.*100|floor/100) of $\(.data.limits.maxMonthlyUsageUsd) (pay/upgrade at console.apify.com)" else empty end) else "token rejected" end' 2>/dev/null)"
+      if [ -n "$apify_bad" ]; then no apify "$apify_bad"; else ok apify "within monthly cap"; fi
+    fi
     if [ -n "${APIFY_TOKEN:-}" ]; then ok instagram "reach instagram <user>  (Apify, no cookies)"; else no instagram "set APIFY_TOKEN in $KEYS"; fi
     if [ -n "${APIFY_TOKEN:-}" ]; then ok reddit "reach reddit <sub>  (Apify, no app/cookies)"; else no reddit "set APIFY_TOKEN in $KEYS"; fi
     if [ -n "${APIFY_TOKEN:-}" ]; then
