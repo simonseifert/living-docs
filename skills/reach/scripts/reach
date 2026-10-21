@@ -426,7 +426,14 @@ except Exception as exc:
     if [ -n "${APIFY_TOKEN:-}" ]; then
       al="$(curl -s --max-time 12 -H "Authorization: Bearer $APIFY_TOKEN" https://api.apify.com/v2/users/me/limits 2>/dev/null)"
       apify_bad="$(printf '%s' "$al" | jq -r 'if .data then (if .data.current.monthlyUsageUsd >= .data.limits.maxMonthlyUsageUsd then "over monthly cap: $\(.data.current.monthlyUsageUsd|.*100|floor/100) of $\(.data.limits.maxMonthlyUsageUsd) (pay/upgrade at console.apify.com)" else empty end) else "token rejected" end' 2>/dev/null)"
-      if [ -n "$apify_bad" ]; then no apify "$apify_bad"; else ok apify "within monthly cap"; fi
+      # The cap can be fine while runs are still refused: on 2026-10-22 every run got
+      # 403 "Too many outstanding invoices" and the account had dropped to FREE, where
+      # some Store actors also bill up to 100x per item. /users/me is free to call too.
+      if [ -z "$apify_bad" ]; then
+        me="$(curl -s --max-time 12 -H "Authorization: Bearer $APIFY_TOKEN" https://api.apify.com/v2/users/me 2>/dev/null)"
+        apify_bad="$(printf '%s' "$me" | jq -r 'if .data and (.data.isPaying != true or .data.plan.tier == "FREE") then "on the FREE plan (unpaid invoice? paid actors refuse or bill up to 100x; console.apify.com/billing)" else empty end' 2>/dev/null)"
+      fi
+      if [ -n "$apify_bad" ]; then no apify "$apify_bad"; else ok apify "paid plan, within monthly cap"; fi
     fi
     if [ -n "${APIFY_TOKEN:-}" ]; then ok instagram "reach instagram <user>  (Apify, no cookies)"; else no instagram "set APIFY_TOKEN in $KEYS"; fi
     if [ -n "${APIFY_TOKEN:-}" ]; then ok reddit "reach reddit <sub>  (Apify, no app/cookies)"; else no reddit "set APIFY_TOKEN in $KEYS"; fi
