@@ -554,6 +554,43 @@ def distinctive(old):
     return toks
 
 
+SLICE_CHARS = 24000   # what the local model gets; ~6k tokens, finishes in a few minutes
+
+
+def focus_slice(old, fetched, budget=SLICE_CHARS):
+    """The parts of a big page that matter for this section, in page order.
+
+    Big sources (an llms.txt index, a full changelog) used to go in as the first
+    60k chars, which timed the local model out and often cut off the relevant
+    part. Score ~1.5k-char blocks by how many of the old section's distinctive
+    tokens (versions, prices, names) and plain words they contain; keep the best
+    blocks up to the budget, plus the page start for context.
+    """
+    if len(fetched) <= budget:
+        return fetched
+    toks = set(distinctive(old)) | {w.lower() for w in re.findall(r"[A-Za-z]{5,}", old)}
+    blocks, cur = [], ""
+    for para in re.split(r"\n\s*\n", fetched):
+        if cur and len(cur) + len(para) > 1500:
+            blocks.append(cur)
+            cur = ""
+        cur += para + "\n\n"
+    if cur:
+        blocks.append(cur)
+    scored = []
+    for i, b in enumerate(blocks):
+        low = b.lower()
+        score = sum(3 for t in toks if t in b) + sum(1 for t in toks if t in low)
+        scored.append((score, i))
+    keep, used = {0}, len(blocks[0])
+    for score, i in sorted(scored, reverse=True):
+        if score == 0 or used + len(blocks[i]) > budget:
+            continue
+        keep.add(i)
+        used += len(blocks[i])
+    return "\n[...]\n".join(blocks[i] for i in sorted(keep))
+
+
 def verified(old, fetched):
     hits = [t for t in distinctive(old) if t in fetched]
     return len(hits) >= 3
@@ -661,11 +698,11 @@ def call_model(tool, name, old, fetched):
     with tempfile.TemporaryDirectory() as td:
         po, pf = Path(td) / "old.md", Path(td) / "fetched.md"
         po.write_text(old)
-        pf.write_text(fetched)
+        pf.write_text(focus_slice(old, fetched))
         out = subprocess.run(
             [sys.executable, str(SCRIPTS / "groq_refresh.py"), "--provider", "local",
              "--old", str(po), "--fetched", str(pf), "--section", name, "--tool", tool,
-             "--model", CTX_MODEL, "--max-chars", "60000"],
+             "--model", CTX_MODEL, "--max-chars", str(SLICE_CHARS + 2000)],
             capture_output=True, text=True, timeout=1200)
     if out.returncode != 0:
         raise RuntimeError((out.stderr.strip() or "model call failed")[:150])
