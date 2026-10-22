@@ -272,9 +272,17 @@ def tool_sections(stale, tool):
         if sec is None or eligible(sec):
             continue
         out.append({"tool": tool, "name": name, "url": sec["url"], "stale": is_stale,
+                    "last_fetched": str(sec.get("last_fetched") or ""),
                     "heading": sec.get("heading"), "note": sec.get("note"),
                     "overdue": over if over is not None else -9999})
     return out
+
+
+def pending_since_move(stale, tool, state):
+    """Sections of a moved tool that are stale or not fetched since the move."""
+    since = (state.get(tool) or {}).get("changed_since") or _today()
+    return [s for s in tool_sections(stale, tool)
+            if s["stale"] or not s["last_fetched"] or s["last_fetched"] < since]
 
 
 def select(stale, detect, tools, explicit, max_n, all_tools=False):
@@ -285,11 +293,29 @@ def select(stale, detect, tools, explicit, max_n, all_tools=False):
     eligible_count = {}
     for t in tools:
         eligible_count[t] = len(tool_sections(stale, t)) if t in moved or t in recent else 0
+    # A moved tool only needs the sections not re-verified since the move was
+    # first seen. Tools with nothing left are accepted (detector baseline reset).
+    # Round-robin across moved tools, capped at half the run, so one big tool or
+    # a backlog of moved tools cannot starve the stale sections of the rest.
+    state = detect.load_state()
+    queues = []
     for t in moved:
-        secs = sorted(tool_sections(stale, t), key=lambda s: -s["overdue"])
-        for s in secs:
+        pending = pending_since_move(stale, t, state)
+        if not pending:
+            detect.accept(t)
+            continue
+        queues.append(sorted(pending, key=lambda s: -s["overdue"]))
+    cap = max(1, max_n // 2)
+    while queues and len(picked) < cap:
+        for q in list(queues):
+            if not q:
+                queues.remove(q)
+                continue
+            s = q.pop(0)
             picked.append(s)
-            seen.add((t, s["name"]))
+            seen.add((s["tool"], s["name"]))
+            if len(picked) >= cap:
+                break
     rest = []
     for t in sorted(recent):
         rest += [s for s in tool_sections(stale, t) if s["stale"] and (t, s["name"]) not in seen]
@@ -809,7 +835,7 @@ def main(argv):
             files += [LIB / t / "history.md", LIB / t / "sources.yaml"]
             if any(r["outcome"] == "patched" for r in rs):
                 files.append(LIB / t / "brief.md")
-            if all(r.get("restamp") for r in rs) and len(rs) >= elig.get(t, 0):
+            if t in moved and not pending_since_move(stale, t, detect.load_state()):
                 detect.accept(t)
         write_changelog(touched, date)
         if a.commit:
