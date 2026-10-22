@@ -1,0 +1,39 @@
+name: check
+on: [push, pull_request]
+jobs:
+  scripts:
+    runs-on: ubuntu-latest
+    env:
+      DOCS_REFERENCE_DIR: ${{ github.workspace }}/examples
+      VAULT_DIR: ${{ github.workspace }}/examples
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pyyaml
+      - name: compile + shell syntax
+        run: |
+          python -m py_compile skills/docs/scripts/*.py
+          bash -n skills/docs/scripts/probe_llmstxt.sh install.sh skills/reach/scripts/reach
+      - name: refresh guards selftest
+        run: python skills/docs/scripts/refresh_batch.py --selftest
+      - name: example library is healthy
+        run: |
+          python skills/docs/scripts/stale.py --lint
+          python skills/docs/scripts/stale.py --summary
+          python skills/docs/scripts/search.py "rate limit" --limit 2
+          python skills/docs/scripts/describe.py --check
+          python skills/docs/scripts/inbox.py --dry-run
+      - name: skill frontmatter fits the listing cap
+        run: |
+          python - <<'PY'
+          import yaml
+          s = open("skills/docs/SKILL.md").read()
+          fm = yaml.safe_load(s.split("---")[1])
+          n = len(fm["description"]) + len(fm.get("when_to_use", ""))
+          assert n <= 1536, n
+          print("frontmatter ok,", n, "chars")
+          PY

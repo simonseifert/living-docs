@@ -63,24 +63,56 @@ platform built by this skill. It is the depth bar.
 
 ## Keeping briefs fresh, cheaply
 
-The point of a "living" reference is that maintenance stays cheap. Two moves keep it that way:
+Maintenance has to stay cheap or the library rots. Every layer below costs nothing or runs
+on a free model, and your main agent is never in the loop.
 
-- **Detection is free.** `scripts/stale.py` is pure local Python: it reads each `sources.yaml`, compares `last_fetched + ttl_days` against today, and prints what is stale. No model, no network, no cost. `/docs --stale` runs it.
-- **Only patching spends a model, and a cheap one.** When a section is stale, `reach` re-fetches the source and `scripts/groq_refresh.py` asks an OpenAI-compatible cheap model whether the facts actually changed, returning a corrected section only if they did. Groq `gpt-oss-120b` is the default (fast, free-tier); `--provider local` runs it free on your own Ollama, and `--provider deepseek` swaps in DeepSeek for stronger judgment or bigger inputs. Your main agent is never in this loop, so refreshing does not burn frontier tokens.
+| Step | Script | Cost |
+|---|---|---|
+| What is stale? `last_fetched + ttl_days` per section | `stale.py` (`--lint`, `--summary`) | free, local |
+| What actually moved? GitHub release tag, npm/PyPI version, RSS date, page hash | `detect.py` | free, ~10 s for 90 tools |
+| Did the facts change? Compare the old section with the re-fetched page | `groq_refresh.py` | free: local Ollama first (`--provider auto`), Groq free tier as fallback |
+| Do it unattended every night | `refresh_batch.py` | free on your own GPU |
+| Tell me what drifted | `docs_freshness.py` | free, one ntfy push |
 
-- **Free change detectors.** `scripts/detect.py` polls each brief's `change_detector` (a GitHub release tag, npm/PyPI version, RSS date, or a page hash) in a few seconds for the whole library, so you refresh what actually moved, not just what aged out.
-- **Unattended nightly refresh on your own GPU.** `scripts/refresh_batch.py` picks the moved and stale sections of the tools you used recently, re-fetches them, has a local Ollama model (`gpt-oss:20b`) check them, patches only real changes, restamps only when the page really contained the facts, commits, and sends one ntfy summary. `git revert` undoes any run.
-- **Search instead of loading.** `scripts/search.py "<query>" --tool <tool>` (SQLite FTS5 over every brief and raw dump, incremental) returns the few relevant passages, so an agent never has to load a whole brief or a 12 MB help-center mirror.
-- **Lint.** `scripts/stale.py --lint` catches manifests the checker cannot trust (invalid YAML, wrong keys, missing dates).
+**The nightly refresh** (`refresh_batch.py --max 60 --commit` from a systemd or launchd
+timer, plus a weekly `--all-tools` sweep) picks the moved and stale sections of the tools
+you actually used recently, re-fetches each, asks a local model (`gpt-oss:20b`) whether the
+facts changed, patches only real changes, commits, and sends one summary. `git revert`
+undoes any night. It is built for running unattended against pages it does not trust:
 
-Optional: `scripts/docs_freshness.py` runs the free detector on a schedule (launchd or cron) and sends one ntfy push listing what drifted, so you refresh on a signal instead of from memory. Copy [`examples/ntfy.example.json`](examples/ntfy.example.json), set `$DOCS_NTFY_CONFIG`, and schedule it.
+- a section is only marked verified if the fetched page contains that section's own
+  distinctive facts (numbers, versions, names), so a bot wall or the wrong page cannot
+  silently "confirm" stale facts;
+- patches that add instruction-like text, add a URL found in neither the old section nor
+  the page, drop dates, or change the section length wildly are rejected;
+- it only fetches http(s), never shells out with a string, and can yield the GPU to
+  another resident model (`DOCS_GPU_YIELD_TO`);
+- when a version moves, it lists every other line of the brief that still names the old
+  version, instead of guessing a find-and-replace.
+
+## Making agents actually use it
+
+The finding that shaped this: in a blind test, a fresh agent asked an n8n question went
+straight to web search, although a curated n8n brief sat on disk. An agent decides from
+the skill listing alone, and "use it when the task is about a tool" does not tell it
+*which* tools have briefs. `scripts/describe.py` writes your tool names into the skill's
+`when_to_use` (most active first, within Claude Code's 1,536-character listing cap). After
+that, the same test opened the brief first and answered from it. Run it whenever you add
+a tool; the nightly job does too.
+
+Inside a big brief or a 12 MB help-center mirror, agents search instead of loading:
+`docs-search "webhook retry" --tool n8n` (SQLite FTS5 over every brief and raw dump,
+incremental, curated briefs ranked above raw dumps) returns the few passages that matter.
 
 ## Commands
 
 ```
 /docs <tool>                build a brief, or open it if it is still fresh
-/docs refresh <tool>        re-fetch only the stale sections
-/docs --stale               list every brief with per-section staleness
+/docs <tool> --deep         also mirror the full catalog, OpenAPI, help center, wider community
+/docs refresh <tool>        re-fetch only the stale or moved sections
+/docs search <query>        full-text search across all briefs and raw dumps
+/docs absorb                file facts you flagged in your notes into the right brief
+/docs --stale | --lint      staleness per section | manifest health
 /docs list                  list all briefs
 /docs import <tool> <path>  adopt an existing hand-written guide as a managed brief
 ```
@@ -118,8 +150,8 @@ and falls back to the DeepWiki MCP (which also answers free-form `ask_question` 
 
 The keyless commands (`web`, `repo-wiki`, `yt`, `rss`, `repo`) work out of the box. Search
 and the crawl paths use optional API keys, kept in `~/.reach/keys.env` (gitignored, chmod
-600). Every path degrades instead of failing: Jina falls back to Firecrawl falls back to
-raw curl, and `reach` prints which backend it used on stderr.
+600). Every path degrades instead of failing: `web` goes Jina, then a free local headless
+Chromium, then Firecrawl, then curl, and `reach` prints which backend served it on stderr.
 
 The public X routes run through Apify Actors: keyed API, no cookies, no account
 risk. They leave the cookie-backed `reach x` route intact. Both default to 20
@@ -138,17 +170,23 @@ Requires [Claude Code](https://claude.com/claude-code). From a clone of this rep
 ./install.sh
 ```
 
-That symlinks `skills/docs` and `skills/reach` into `~/.claude/skills/`, puts `reach` on
-your `PATH`, and creates `~/.reach/keys.env` from the example. The reference library
+That symlinks `skills/docs` and `skills/reach` into `~/.claude/skills/` (an existing real
+copy is moved to `~/.claude/skills-backup/` first), puts `reach` and `docs-search` on your
+`PATH`, and creates `~/.reach/keys.env` from the example. The reference library
 defaults to `~/docs-reference` (override with `DOCS_REFERENCE_DIR`). Then, in Claude Code:
 
 ```
 /docs supabase
 ```
 
-Optional, for a stronger `reach`: install `yt-dlp`, `gh`, and `pandoc`, and add any of
-`EXA_API_KEY`, `JINA_API_KEY`, `FIRECRAWL_API_KEY` to `~/.reach/keys.env`. For cheap-model
-brief refreshing, add `GROQ_API_KEY` (free tier) or `DEEPSEEK_API_KEY`.
+**Requirements:** Python 3.10+ with SQLite FTS5 (standard in most builds). PyYAML is
+recommended (`pip install pyyaml`); without it a small fallback parser is used.
+
+**Optional:** [Ollama](https://ollama.com) with `gpt-oss:20b` for free local refreshes
+(fits a 16 GB GPU). `yt-dlp`, `gh` and Playwright for a stronger `reach`. Any of
+`EXA_API_KEY`, `JINA_API_KEY`, `FIRECRAWL_API_KEY`, `GROQ_API_KEY` (free tier) or
+`DEEPSEEK_API_KEY` in `~/.reach/keys.env`. A self-hosted or access-controlled
+[ntfy](https://ntfy.sh) for pings: on public ntfy.sh anyone who knows a topic can read it.
 
 ## What this is, and what it is not
 

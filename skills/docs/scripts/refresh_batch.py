@@ -152,15 +152,51 @@ def restamp(path, section_name, date):
     return ok
 
 
+# Self-contained fixtures (one list-form, one dict-form manifest) so the
+# selftest runs anywhere, including CI, without a real library.
+FIXTURE_LIST = """# list form
+tool: listtool
+change_detector:
+  type: github_releases
+  last_value: v1.0.0
+sections:
+  - name: node-catalog
+    url: https://example.com/catalog
+    method: scrape
+    last_fetched: 2026-07-04
+    ttl_days: 30
+    status: ok
+  - name: pricing
+    url: "https://example.com/pricing#plans"  # fragment survives
+    method: scrape
+    last_fetched: 2026-07-04
+    ttl_days: 30
+    status: partial
+"""
+FIXTURE_DICT = """tool: dicttool
+sections:
+  overview:
+    url: https://example.com/llms.txt
+    last_fetched: 2026-09-09
+    ttl_days: 180
+    status: ok
+  docs:
+    url: https://example.com/llms-full.txt
+    last_fetched: 2026-09-09
+    ttl_days: 30
+    status: ok
+"""
+
+
 def selftest():
-    """Unit-test restamp() on copies of one list-form and one dict-form file."""
+    """Unit-test restamp() on one list-form and one dict-form manifest."""
     tmp = Path(tempfile.mkdtemp(prefix="restamp-test-"))
-    cases = [("n8n", "pricing", "node-catalog"), ("tauri", "docs", "overview")]
+    (tmp / "listtool.yaml").write_text(FIXTURE_LIST)
+    (tmp / "dicttool.yaml").write_text(FIXTURE_DICT)
+    cases = [("listtool", "pricing", "node-catalog"), ("dicttool", "docs", "overview")]
     failures = 0
     for tool, sec, other in cases:
-        src = LIB / tool / "sources.yaml"
         dst = tmp / f"{tool}.yaml"
-        shutil.copy(src, dst)
         before = dst.read_text().split("\n")
         ok = restamp(dst, sec, "2099-01-01")
         after = dst.read_text().split("\n")
@@ -175,7 +211,7 @@ def selftest():
         for a, b in changed:
             print(f"    - {a.strip()}\n    + {b.strip()}")
         failures += not good
-    missing = restamp(tmp / "n8n.yaml", "no-such-section", "2099-01-01")
+    missing = restamp(tmp / "listtool.yaml", "no-such-section", "2099-01-01")
     print(f"{'PASS' if not missing else 'FAIL'} restamp unknown section returns False")
     failures += bool(missing)
     shutil.rmtree(tmp)
@@ -722,10 +758,32 @@ def describe(r):
     return f"{r['section']} unverified ({o})"
 
 
-def write_history(tool, results, date):
+def leftover_mentions(tool, state):
+    """Brief lines still naming the pre-move version after a version moved.
+
+    The refresh patches one section; the same version string often also sits
+    in frontmatter (pinned_version), install tips or a detector note. Those are
+    reported, not auto-edited: a plain string replace can be wrong (a page may
+    rightly cite the old version as history).
+    """
+    st = state.get(tool) or {}
+    old, new = st.get("baseline"), st.get("value")
+    if not isinstance(old, str) or not isinstance(new, str) or old == new:
+        return []
+    m = re.search(r"\d+\.\d+(\.\d+)?", old)
+    needle = m.group(0) if m else old.strip()
+    if len(needle) < 3:
+        return []
+    pat = re.compile(r"(?<![\d.])" + re.escape(needle) + r"(?![\d])")
+    lines = (LIB / tool / "brief.md").read_text().splitlines()
+    return [i for i, line in enumerate(lines, 1) if pat.search(line)]
+
+
+def write_history(tool, results, date, note=""):
     p = LIB / tool / "history.md"
     entry = (f"## {date} (auto-refresh, local {MODEL})\n- "
-             + "; ".join(describe(r) for r in results) + "\n\n")
+             + "; ".join(describe(r) for r in results) + "\n"
+             + (f"- {note}\n" if note else "") + "\n")
     text = p.read_text() if p.exists() else f"# {tool} brief history\n\n"
     m = re.search(r"^## ", text, re.M)
     text = text[:m.start()] + entry + text[m.start():] if m else text.rstrip("\n") + "\n\n" + entry
@@ -827,11 +885,21 @@ def main(argv):
         by_tool.setdefault(r["tool"], []).append(r)
     touched = {t: rs for t, rs in by_tool.items() if any(r.get("restamp") for r in rs)}
 
+    leftovers = {}
     if not a.dry_run and touched:
         date = _today()
         files = [LIB / "CHANGELOG.md"]
+        dstate = detect.load_state()
         for t, rs in touched.items():
-            write_history(t, rs, date)
+            note = ""
+            if t in moved:
+                hits = leftover_mentions(t, dstate)
+                if hits:
+                    old = dstate[t]["baseline"]
+                    note = (f"STILL SAYS {old} on brief.md line(s) {', '.join(map(str, hits[:10]))}: "
+                            f"check and update by hand or with /docs refresh {t}")
+                    leftovers[t] = (old, hits)
+            write_history(t, rs, date, note)
             files += [LIB / t / "history.md", LIB / t / "sources.yaml"]
             if any(r["outcome"] == "patched" for r in rs):
                 files.append(LIB / t / "brief.md")
@@ -845,6 +913,7 @@ def main(argv):
         log = {"date": _today(), "checked": checked, "changed": changed,
                "selected": len(picked), "moved_tools": moved, "stopped": stopped,
                "heading_paths": HEADING_PATHS,
+               "leftover_versions": {t: {"old": o, "lines": h} for t, (o, h) in leftovers.items()},
                "results": results}
         out = LIB / "_state" / f"refresh-{_today()}.json"
         out.parent.mkdir(parents=True, exist_ok=True)
@@ -852,6 +921,8 @@ def main(argv):
 
     body = "\n".join(f"{r['tool']}/{r['section']}: {r['outcome']} {r['summary']}".rstrip()
                      for r in results) or "nothing selected"
+    for t, (old, hits) in sorted(leftovers.items()):
+        body += f"\n{t}: brief still says {old} on {len(hits)} line(s), fix by hand"
     if stopped:
         body += "\n" + stopped
     print(f"checked {checked}, changed {changed}" + (" (dry run)" if a.dry_run else ""))

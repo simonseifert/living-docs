@@ -10,14 +10,14 @@ change_detector:
   last_value: v2-2026-07-01T115402Z
   note: info.version is a timestamp; diff the string to detect any API-surface change.
 
-sources:
+sections:
   - name: docs-index
     url: https://docs.apify.com/llms.txt
     method: llms.txt
     last_fetched: 2026-07-02
     ttl_days: 30
     status: ok
-    note: LLM doc index; full twin llms-full.txt (~43MB): do NOT load whole.
+    note: "LLM doc index; full twin llms-full.txt (~43MB): do NOT load whole."
 
   - name: docs-md-twin
     url: https://docs.apify.com/api.md
@@ -73,7 +73,7 @@ sources:
     last_fetched: 2026-07-02
     ttl_days: 7
     status: ok
-    note: HTML only: no RSS/JSON. Scrape or rely on openapi info.version detector.
+    note: "HTML only: no RSS/JSON. Scrape or rely on openapi info.version detector."
 
   - name: status-json
     url: https://status.apify.com/api/v2/status.json

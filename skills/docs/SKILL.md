@@ -1,7 +1,7 @@
 ---
 name: docs
 description: 'Build and maintain a local, living reference brief for any tool, service, API or SDK in the stack (n8n, Apify, Supabase, Next.js, Stripe, anything). Covers far more than API docs: features, pricing, changelog, status, integrations/actors, gotchas and curated community, plus a sources manifest with per-section freshness. Use it whenever the current task is genuinely about a specific tool: open its brief, refresh it if stale, or build it if missing.'
-when_to_use: 'Trigger phrases: "learn <tool>", "research our stack", "know <tool> inside out", "fetch the latest docs for <tool>", "what can <tool> do", "refresh the <tool> brief", "search the docs for", or starting real work against a tool. Never wire it into a session-start hook or global import.'
+when_to_use: 'Trigger phrases: "learn <tool>", "research our stack", "know <tool> inside out", "fetch the latest docs for <tool>", "what can <tool> do", "refresh the <tool> brief", "search the docs for", or starting real work against a tool. Run scripts/describe.py once you have briefs: it lists your tools here so agents open the brief before searching the web. Never wire it into a session-start hook.'
 argument-hint: "<tool> [--deep] | refresh <tool> | search <query> | absorb | --stale | --lint | list | import <tool> <path>"
 allowed-tools: Bash(python3 ${CLAUDE_SKILL_DIR}/scripts/*) Bash(${CLAUDE_SKILL_DIR}/scripts/*) Bash(docs-search *)
 ---
@@ -90,7 +90,7 @@ Follow `references/discovery-playbook.md` for the full per-surface how-to. Summa
 
 **6. Write `sources.yaml`** using `references/sources-schema.md`: one entry per section under a top-level `sections:` list (not `sources:`), each with `name`, `url`, `method`, `last_fetched`, `ttl_days`, `status` (ok | partial | auth-required | unverified). Quote any value that contains `: ` or starts with a special character. Then run `scripts/stale.py --lint <tool>`; it must report no problems before you commit. Invalid YAML or the wrong key silently breaks staleness checks.
 
-**7. Append to the history log, update `INDEX.md`, commit.** Prepend a dated entry to `<tool>/history.md` (create it on first build) summarizing what this run did: date, versions/prices verified, sections written or changed. Add the same one-liner to the top-level `CHANGELOG.md` under today's date. Then `cd ~/docs-reference && git add <tool> INDEX.md CHANGELOG.md && git commit -m "docs: <build|refresh> <tool>"`. Confirm the commit; do not push unless the user asks.
+**7. Append to the history log, update `INDEX.md`, commit.** Prepend a dated entry to `<tool>/history.md` (create it on first build) summarizing what this run did: date, versions/prices verified, sections written or changed. Add the same one-liner to the top-level `CHANGELOG.md` under today's date. Then `cd ~/docs-reference && git add <tool> INDEX.md CHANGELOG.md && git commit -m "docs: <build|refresh> <tool>"`. Confirm the commit; do not push unless the user asks. For a NEW tool, also run `scripts/describe.py` so the skill listing names it (agents only reach for /docs when they can see a brief exists; the nightly job does this too).
 
 ## Refresh algorithm
 
