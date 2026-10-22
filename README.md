@@ -66,7 +66,12 @@ platform built by this skill. It is the depth bar.
 The point of a "living" reference is that maintenance stays cheap. Two moves keep it that way:
 
 - **Detection is free.** `scripts/stale.py` is pure local Python: it reads each `sources.yaml`, compares `last_fetched + ttl_days` against today, and prints what is stale. No model, no network, no cost. `/docs --stale` runs it.
-- **Only patching spends a model, and a cheap one.** When a section is stale, `reach` re-fetches the source and `scripts/groq_refresh.py` asks an OpenAI-compatible cheap model whether the facts actually changed, returning a corrected section only if they did. Groq `gpt-oss-120b` is the default (fast, free-tier); `--provider deepseek` swaps in DeepSeek for stronger judgment or bigger inputs. Your main agent is never in this loop, so refreshing does not burn frontier tokens.
+- **Only patching spends a model, and a cheap one.** When a section is stale, `reach` re-fetches the source and `scripts/groq_refresh.py` asks an OpenAI-compatible cheap model whether the facts actually changed, returning a corrected section only if they did. Groq `gpt-oss-120b` is the default (fast, free-tier); `--provider local` runs it free on your own Ollama, and `--provider deepseek` swaps in DeepSeek for stronger judgment or bigger inputs. Your main agent is never in this loop, so refreshing does not burn frontier tokens.
+
+- **Free change detectors.** `scripts/detect.py` polls each brief's `change_detector` (a GitHub release tag, npm/PyPI version, RSS date, or a page hash) in a few seconds for the whole library, so you refresh what actually moved, not just what aged out.
+- **Unattended nightly refresh on your own GPU.** `scripts/refresh_batch.py` picks the moved and stale sections of the tools you used recently, re-fetches them, has a local Ollama model (`gpt-oss:20b`) check them, patches only real changes, restamps only when the page really contained the facts, commits, and sends one ntfy summary. `git revert` undoes any run.
+- **Search instead of loading.** `scripts/search.py "<query>" --tool <tool>` (SQLite FTS5 over every brief and raw dump, incremental) returns the few relevant passages, so an agent never has to load a whole brief or a 12 MB help-center mirror.
+- **Lint.** `scripts/stale.py --lint` catches manifests the checker cannot trust (invalid YAML, wrong keys, missing dates).
 
 Optional: `scripts/docs_freshness.py` runs the free detector on a schedule (launchd or cron) and sends one ntfy push listing what drifted, so you refresh on a signal instead of from memory. Copy [`examples/ntfy.example.json`](examples/ntfy.example.json), set `$DOCS_NTFY_CONFIG`, and schedule it.
 

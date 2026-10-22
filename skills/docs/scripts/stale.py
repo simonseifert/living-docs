@@ -9,6 +9,7 @@ Usage:
     stale.py <tool>          # one tool
     stale.py --json          # machine-readable output
     stale.py --lint          # check every sources.yaml parses and has the fields stale.py needs
+    stale.py --summary       # one short paragraph (injected into SKILL.md when /docs loads)
 
 Pure stdlib (uses PyYAML when installed). TTL may be an int (days) or the
 string "on-demand" (never stale). Accepts the section list under `sections:`
@@ -148,6 +149,37 @@ def check_tool(tool_dir):
     return {"tool": tool, "rows": rows}
 
 
+def summary(tool_dirs):
+    """Print a 2-3 line library status. Live status sections are ignored."""
+    results = [r for r in (check_tool(d) for d in tool_dirs) if r]
+    worst, n_stale = [], 0
+    for r in results:
+        rows = [row for row in r["rows"] if row[4] and "status" not in row[0].lower()]
+        if not rows:
+            continue
+        n_stale += len(rows)
+        over = max((row[3] if row[3] is not None else 10**6) for row in rows)
+        worst.append((over, r["tool"]))
+    worst.sort(reverse=True)
+    tools_stale = len(worst)
+    print(f"Library: {len(results)} briefs at {LIB}; {tools_stale} have stale content "
+          f"sections ({n_stale} total).")
+    if worst:
+        top = ", ".join(f"{t} ({'never fetched' if o >= 10**6 else f'{o}d over'})"
+                        for o, t in worst[:5])
+        print(f"Most overdue: {top}.")
+    state = LIB / "_state"
+    runs = sorted(state.glob("refresh-*.json")) if state.exists() else []
+    if runs:
+        try:
+            last = json.loads(runs[-1].read_text())
+            print(f"Last auto-refresh: {runs[-1].stem[8:]} "
+                  f"({last.get('checked', '?')} checked, {last.get('changed', '?')} changed).")
+        except Exception:
+            pass
+    return 0
+
+
 def lint(tool_dirs):
     """Report manifests stale.py cannot fully trust. Exit 1 if any problem."""
     problems = 0
@@ -200,6 +232,9 @@ def main(argv):
 
     if "--lint" in argv:
         return lint(tool_dirs)
+
+    if "--summary" in argv:
+        return summary(tool_dirs)
 
     results = [r for r in (check_tool(d) for d in tool_dirs) if r]
 
