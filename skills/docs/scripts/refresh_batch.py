@@ -422,6 +422,31 @@ def ensure_ctx_model():
     subprocess.run(["ollama", "create", CTX_MODEL, "-f", str(mf)], capture_output=True, timeout=300)
 
 
+# Fetched pages are untrusted and this runs unattended, so a page could try to
+# steer the model into writing instructions or links into a brief that agents
+# later read. Patches may only correct facts: no instruction-like text, no URLs
+# that appear in neither the old section nor the fetched page.
+INJECTION_RE = re.compile(
+    r"ignore (all |any |the )?(previous|prior|above) (instructions|prompts?)"
+    r"|disregard (all |any |the )?(previous|prior|above)"
+    r"|you are now|system prompt|do not tell the user|as an ai (agent|assistant)"
+    r"|<\s*/?\s*(system|instructions?)\s*>|\bassistant\s*:", re.I)
+URL_RE = re.compile(r"https?://[^\s)>\]\"']+")
+
+
+def suspicious_patch(old, fetched, new):
+    """Reason string if a model patch should not be applied, else ''."""
+    if INJECTION_RE.search(new) and not INJECTION_RE.search(old):
+        return "patch contains instruction-like text"
+    if INJECTION_RE.search(fetched):
+        return "fetched page contains instruction-like text"
+    known = set(URL_RE.findall(old)) | set(URL_RE.findall(fetched))
+    added = [u for u in URL_RE.findall(new) if u.rstrip(".,;") not in {k.rstrip(".,;") for k in known}]
+    if added:
+        return f"patch adds unseen URL {added[0][:80]}"
+    return ""
+
+
 def call_model(tool, name, old, fetched):
     with tempfile.TemporaryDirectory() as td:
         po, pf = Path(td) / "old.md", Path(td) / "fetched.md"
@@ -483,6 +508,11 @@ def process(sec, dry):
         ratio = len(new.strip()) / max(len(old.strip()), 1)
         if not new.strip() or ratio > 2 or ratio < 0.4:
             res["outcome"] = "rejected-patch"
+            return res
+        why = suspicious_patch(old, fetched, new)
+        if why:
+            res["outcome"] = "rejected-patch"
+            res["summary"] = why
             return res
         res["outcome"] = "patched"
         res["restamp"] = True

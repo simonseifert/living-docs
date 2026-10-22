@@ -32,6 +32,7 @@ import json
 import hashlib
 import datetime
 import subprocess
+import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
@@ -82,12 +83,28 @@ def github_token():
     return _gh_token
 
 
+class _DropAuthOnHostChange(urllib.request.HTTPRedirectHandler):
+    """Never forward the GitHub token to a different host on redirect."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new is not None and urllib.parse.urlsplit(newurl).hostname != "api.github.com":
+            new.remove_header("Authorization")
+        return new
+
+
+_OPENER = urllib.request.build_opener(_DropAuthOnHostChange)
+
+
 def fetch(url):
     headers = {"User-Agent": UA}
-    if "api.github.com" in url and github_token():
+    parts = urllib.parse.urlsplit(url)
+    # exact host + https only: a substring check would hand the token to
+    # e.g. https://api.github.com.evil.example/
+    if parts.scheme == "https" and parts.hostname == "api.github.com" and github_token():
         headers["Authorization"] = "Bearer " + github_token()
     req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=20) as resp:
+    with _OPENER.open(req, timeout=20) as resp:
         return resp.read().decode("utf-8", errors="replace")
 
 
