@@ -12,15 +12,19 @@ Usage:
     # prints JSON: {"changed": bool, "summary": "...", "updated_section": "..."|null}
 
 Provider (OpenAI-compatible, pick with --provider):
-    groq      [default]  openai/gpt-oss-120b @ api.groq.com  (fast, free-tier, key=GROQ_API_KEY)
+    auto      [default]  privacy first: "local" if Ollama answers GET <base>/api/tags within
+                         3 s, else groq with a one-line stderr notice (brief sections can hold
+                         private client context, so they stay off the cloud when possible)
+    groq                 openai/gpt-oss-120b @ api.groq.com  (fast, free-tier, key=GROQ_API_KEY)
     deepseek             deepseek-chat @ api.deepseek.com     (stronger, bigger inputs, key=DEEPSEEK_API_KEY)
-    local                gpt-oss:20b @ a local Ollama          (free, no key, no request-size cap;
+    local                gpt-oss-docs:20b (32k ctx) if ollama lists it, else gpt-oss:20b, on a
+                         local Ollama (free, no key, no request-size cap;
                          base from $OLLAMA_URL, default http://127.0.0.1:11434/v1)
     --model / --base override either. Keys are read from env or ~/.reach/keys.env.
 
-Why Groq is the default: for this light task (compare a section to a fetched
+Why Groq is the cloud fallback: for this light task (compare a section to a fetched
 public page, emit a JSON verdict) gpt-oss-120b is accurate enough, much faster,
-already configured, and free. Switch to --provider deepseek when you want stronger
+already configured, and free. Use --provider deepseek when you want stronger
 judgment on ambiguous facts or need to send a bigger source (Groq caps request size).
 
 Pure stdlib. No secrets are ever printed.
@@ -28,6 +32,7 @@ Pure stdlib. No secrets are ever printed.
 import argparse
 import json
 import os
+import subprocess
 import sys
 import time
 import urllib.error
@@ -75,6 +80,34 @@ SYSTEM = (
     'Respond with ONLY a JSON object: {"changed": bool, "summary": "<=15 words", '
     '"updated_section": "<full corrected markdown, or null if unchanged>"}.'
 )
+
+
+LOCAL_PREFERRED = "gpt-oss-docs:20b"
+
+
+def ollama_base():
+    """Ollama root (no /v1) derived from OLLAMA_URL."""
+    base = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434/v1").rstrip("/")
+    return base[:-3] if base.endswith("/v1") else base
+
+
+def ollama_up():
+    try:
+        with urllib.request.urlopen(ollama_base() + "/api/tags", timeout=3) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+
+def local_model():
+    """gpt-oss-docs:20b (32k context) if ollama lists it, else the stock tag."""
+    try:
+        out = subprocess.run(["ollama", "list"], capture_output=True, text=True, timeout=10).stdout
+        if any(line.split()[:1] == [LOCAL_PREFERRED] for line in out.splitlines()):
+            return LOCAL_PREFERRED
+    except Exception:
+        pass
+    return PROVIDERS["local"]["model"]
 
 
 def a_local(base):
@@ -129,16 +162,22 @@ def main(argv):
     ap.add_argument("--fetched", required=True)
     ap.add_argument("--section", required=True)
     ap.add_argument("--tool", default="")
-    ap.add_argument("--provider", default="groq", choices=list(PROVIDERS))
+    ap.add_argument("--provider", default="auto", choices=["auto"] + list(PROVIDERS))
     ap.add_argument("--model", default=None, help="override the provider's default model")
     ap.add_argument("--base", default=None, help="override the provider's default base URL")
     ap.add_argument("--max-chars", type=int, default=11000,
                     help="cap on fetched-source chars sent (Groq caps request size)")
     a = ap.parse_args(argv)
 
+    if a.provider == "auto":
+        if ollama_up():
+            a.provider = "local"
+        else:
+            a.provider = "groq"
+            print("groq_refresh: Ollama unreachable, sending this section to Groq", file=sys.stderr)
     prov = PROVIDERS[a.provider]
     base = a.base or prov["base"]
-    model = a.model or prov["model"]
+    model = a.model or (local_model() if a.provider == "local" else prov["model"])
     key = load_key(prov["key_env"]) if prov["key_env"] else "ollama"
     if not key:
         print(json.dumps({"error": f"no {prov['key_env']} in env or {KEYS}"}), file=sys.stderr)

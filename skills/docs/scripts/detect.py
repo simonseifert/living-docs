@@ -10,6 +10,14 @@ Usage:
     detect.py n8n zod            # only these tools
     detect.py --json             # machine-readable output
     detect.py --only-moved       # hide same/skipped/error lines
+    detect.py --dry-run          # check everything, do not write _state/detect.json
+
+Fetch tiers (the result notes any tier other than "direct"):
+    direct    plain GET (GitHub token only for exact https api.github.com)
+    browser   retry after 403/429 with a browser User-Agent + Accept header
+    reach     HTML pages still blocked: `reach web <url>` text, hashed
+    weak-tls  host offers only weak DH: one retry at SECLEVEL=1, never with auth
+Only http(s) urls are fetched; anything else in `urls` is skipped.
 
 Strategy per url (the `type:` spelling is ignored on purpose):
     JSON body + dotted `field`   -> that field's value
@@ -27,11 +35,13 @@ DOCS_REFERENCE_DIR. Pure stdlib plus PyYAML.
 """
 import os
 import re
+import ssl
 import sys
 import json
 import hashlib
 import datetime
 import subprocess
+import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -44,6 +54,17 @@ LIB = Path(os.environ.get(
     Path.home() / "docs-reference",
 ))
 UA = "docs-detect/1.0"
+BROWSER_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,"
+              "application/json;q=0.8,*/*;q=0.7",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+WEAK_TLS_RE = re.compile(r"DH_KEY_TOO_SMALL|dh key too small|EE_KEY_TOO_SMALL|"
+                         r"CA_MD_TOO_WEAK|ee key too small|md too weak", re.I)
+NON_HTML_RE = re.compile(r"\.(json|xml|atom|rss)(\?|$)|/api/|^https?://api\.|/feed|/rss",
+                         re.I)
 PATH_RE = re.compile(r"^[A-Za-z0-9_\-]+(\.[A-Za-z0-9_\-]+)*$")
 NO_BASELINE = ("", "none", "null", "unfetched", "unknown", "n/a")
 
@@ -96,16 +117,71 @@ class _DropAuthOnHostChange(urllib.request.HTTPRedirectHandler):
 _OPENER = urllib.request.build_opener(_DropAuthOnHostChange)
 
 
-def fetch(url):
+class NotAUrl(Exception):
+    """A change_detector entry that is not an http(s) url."""
+
+
+def is_http(url):
+    return isinstance(url, str) and url.startswith(("http://", "https://"))
+
+
+def _open(url, headers, context=None):
+    req = urllib.request.Request(url, headers=headers)
+    if context is not None:
+        # weak-tls path: plain urlopen, no custom handlers, no auth header ever
+        resp = urllib.request.urlopen(req, timeout=20, context=context)
+    else:
+        resp = _OPENER.open(req, timeout=20)
+    with resp:
+        return resp.read().decode("utf-8", errors="replace")
+
+
+def _reach_web(url):
+    env = dict(os.environ)
+    env["PATH"] = str(Path.home() / ".local" / "bin") + os.pathsep + env.get("PATH", "")
+    out = subprocess.run(["reach", "web", url], capture_output=True, text=True,
+                         timeout=90, env=env)
+    if out.returncode != 0 or not out.stdout.strip():
+        raise RuntimeError("reach web failed: " + (out.stderr.strip()[:120] or "empty output"))
+    return out.stdout
+
+
+def fetch_ex(url):
+    """Return (body, tier). Tier is direct, browser, reach or weak-tls."""
+    if not is_http(url):
+        raise NotAUrl(url)
     headers = {"User-Agent": UA}
     parts = urllib.parse.urlsplit(url)
     # exact host + https only: a substring check would hand the token to
     # e.g. https://api.github.com.evil.example/
     if parts.scheme == "https" and parts.hostname == "api.github.com" and github_token():
         headers["Authorization"] = "Bearer " + github_token()
-    req = urllib.request.Request(url, headers=headers)
-    with _OPENER.open(req, timeout=20) as resp:
-        return resp.read().decode("utf-8", errors="replace")
+    try:
+        return _open(url, headers), "direct"
+    except urllib.error.HTTPError as e:
+        if e.code not in (403, 429):
+            raise
+        blocked = e
+    except urllib.error.URLError as e:
+        if parts.scheme == "https" and WEAK_TLS_RE.search(str(e)):
+            ctx = ssl.create_default_context()
+            ctx.set_ciphers("DEFAULT:@SECLEVEL=1")
+            return _open(url, dict(BROWSER_HEADERS), ctx), "weak-tls"
+        raise
+    # blocked: browser headers, never the GitHub token
+    try:
+        return _open(url, dict(BROWSER_HEADERS)), "browser"
+    except urllib.error.HTTPError as e:
+        if e.code not in (403, 429):
+            raise
+        blocked = e
+    if NON_HTML_RE.search(url):
+        raise blocked
+    return _reach_web(url), "reach"
+
+
+def fetch(url):
+    return fetch_ex(url)[0]
 
 
 def dotted_get(obj, path):
@@ -172,8 +248,11 @@ def extract(body, field):
     return text_hash(body)
 
 
-def detect_url(url, field):
-    return extract(fetch(url), field)
+def detect_url(url, field, tiers=None):
+    body, tier = fetch_ex(url)
+    if tiers is not None:
+        tiers.append(tier)
+    return extract(body, field)
 
 
 def baseline_key(url, keys):
@@ -185,8 +264,12 @@ def baseline_key(url, keys):
     return None
 
 
-def current_values(cd):
-    """Return a str (single url) or {key: value} (several urls)."""
+def current_values(cd, tiers=None, notes=None):
+    """Return a str (single url) or {key: value} (several urls).
+
+    Entries that are not http(s) urls are skipped (noted in `notes`);
+    NotAUrl is raised when nothing usable is left.
+    """
     urls = cd.get("urls")
     field = cd.get("field")
     if urls:
@@ -194,10 +277,16 @@ def current_values(cd):
         keys = list(last) if isinstance(last, dict) else []
         out = {}
         for u in urls:
+            if not is_http(u):
+                if notes is not None:
+                    notes.append(f"skipped: not a url ({_short(u)})")
+                continue
             k = baseline_key(u, keys) or u
-            out[k] = detect_url(u, field)
+            out[k] = detect_url(u, field, tiers)
+        if not out:
+            raise NotAUrl("no http(s) url in urls")
         return out
-    return detect_url(cd["url"], field)
+    return detect_url(cd["url"], field, tiers)
 
 
 def _s(v):
@@ -270,8 +359,12 @@ def check_tool(tool, state):
     cd, why = load_detector(tool)
     if cd is None:
         return {"tool": tool, "status": "skipped", "reason": why}, None
+    tiers, notes = [], []
     try:
-        cur = current_values(cd)
+        cur = current_values(cd, tiers, notes)
+    except NotAUrl as e:
+        return {"tool": tool, "status": "skipped",
+                "reason": f"skipped: not a url ({_short(e)})"}, None
     except Exception as e:
         return {"tool": tool, "status": "error", "reason": f"{type(e).__name__}: {e}"}, None
     prev = state.get(tool) or {}
@@ -290,6 +383,11 @@ def check_tool(tool, state):
              "baseline": base, "yaml_last": yaml_last}
     res = {"tool": tool, "status": "moved" if moved else "same",
            "value": cur, "baseline": base, "changed_since": since}
+    via = sorted(set(tiers) - {"direct"})
+    if via:
+        res["via"] = via
+    if notes:
+        res["notes"] = notes
     return res, entry
 
 
@@ -298,8 +396,10 @@ def all_tools():
                   if p.is_dir() and not p.name.startswith((".", "_")))
 
 
-def detect_all(tools=None):
-    """Check tools (default all). Returns {tool: result dict}; updates detect.json."""
+def detect_all(tools=None, save=True):
+    """Check tools (default all). Returns {tool: result dict}.
+
+    Updates detect.json unless save=False (dry run)."""
     tools = list(tools) if tools else all_tools()
     state = load_state()
     with ThreadPoolExecutor(max_workers=8) as ex:
@@ -309,7 +409,8 @@ def detect_all(tools=None):
         results[tool] = res
         if entry is not None:
             state[tool] = entry
-    save_state(state)
+    if save:
+        save_state(state)
     return results
 
 
@@ -326,9 +427,14 @@ def fmt(res):
     t, st = res["tool"], res["status"]
     if st in ("skipped", "error"):
         return f"{t}: {st}({res['reason']})"
+    extra = ""
+    if res.get("via"):
+        extra += "  [" + ",".join(res["via"]) + "]"
+    if res.get("notes"):
+        extra += "  (" + "; ".join(res["notes"]) + ")"
     if st == "moved":
-        return f"{t}: moved  {_short(res['baseline'])} -> {_short(res['value'])}"
-    return f"{t}: same"
+        return f"{t}: moved  {_short(res['baseline'])} -> {_short(res['value'])}{extra}"
+    return f"{t}: same{extra}"
 
 
 def _short(v):
@@ -339,11 +445,12 @@ def _short(v):
 def main(argv):
     as_json = "--json" in argv
     only_moved = "--only-moved" in argv
+    dry = "--dry-run" in argv
     tools = [a for a in argv if not a.startswith("--")]
     if not LIB.exists():
         print(f"library not found: {LIB}", file=sys.stderr)
         return 1
-    results = detect_all(tools or None)
+    results = detect_all(tools or None, save=not dry)
     if only_moved:
         results = {k: v for k, v in results.items() if v["status"] == "moved"}
     if as_json:

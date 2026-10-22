@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """Collect facts flagged for the docs-reference library from the Obsidian vault.
 
-Other pipelines leave pointers in ~/vault notes (lines mentioning
-`docs-reference`, `other:docs-reference` or `#docs-ref`). This script scans
+Other pipelines leave pointers in ~/vault notes. A line counts only with an
+explicit tag (`other:docs-reference`, `#docs-ref`, `#docs-reference`) or when
+it mentions docs-reference together with an action word (save, add, put,
+store, capture, absorb, file into, update, "-> docs", "for the brief") on the
+same or the next line. Bare path mentions do not count. This script scans
 ~/vault/**/*.md with plain file reads (vault is never modified), and appends
 each new hit to <lib>/_inbox/pending.md as a checklist item. `/docs absorb`
 works through that file.
@@ -11,6 +14,7 @@ Usage:
     inbox.py                # scan, append new items, print counts
     inbox.py --dry-run      # report what would be added, write nothing
     inbox.py --json         # machine-readable list of new items
+    inbox.py --prune        # drop pending.md items that fail the rule (keeps seen state)
 
 State: <lib>/_state/inbox-seen.json (hash of file + normalized line), so each
 item is reported once. Skips .obsidian and .trash. Env: DOCS_REFERENCE_DIR
@@ -31,7 +35,11 @@ LIB = Path(os.environ.get(
 ))
 VAULT = Path(os.environ.get("VAULT_DIR", Path.home() / "vault"))
 SKIP_DIRS = {".obsidian", ".trash"}
-PATTERN = re.compile(r"docs-reference|#docs-ref", re.I)
+MENTION = re.compile(r"docs-reference", re.I)
+TAG = re.compile(r"other:docs-reference|#docs-ref", re.I)
+ACTION = re.compile(
+    r"\b(save[sd]?|saving|add(s|ed|ing)?|put|store[sd]?|capture[sd]?|absorb(ed|s)?"
+    r"|file[sd]? into|update[sd]?)\b|->\s*docs|for the brief|into docs-reference", re.I)
 URL_RE = re.compile(r"https?://[^\s)>\]\"']+")
 HEADER = (
     "# Docs inbox\n\n"
@@ -45,11 +53,27 @@ def tool_names():
                   if d.is_dir() and not d.name.startswith(("_", ".")))
 
 
+# Never read notes that hold credentials or private records: their context
+# lines would be copied into the git-tracked pending.md.
+SECRET_NAME = re.compile(r"(api[-_ ]?keys?|secret|password|passwd|credential|token|"
+                         r"\.env|keys?\.md$|_sensitive|private)", re.I)
+# Redact anything credential-shaped that still slips into a context line.
+SECRET_VALUE = re.compile(
+    r"(sk-[A-Za-z0-9_-]{16,}|sk-ant-[A-Za-z0-9_-]+|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_\w+|"
+    r"gsk_[A-Za-z0-9]{16,}|AKIA[0-9A-Z]{16}|xox[abpr]-[A-Za-z0-9-]+|"
+    r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]*|"
+    r"(?<![A-Za-z0-9])[A-Za-z0-9_-]{32,}(?![A-Za-z0-9]))")
+
+
+def redact(text):
+    return SECRET_VALUE.sub("<redacted>", text)
+
+
 def vault_files():
     for root, dirs, files in os.walk(VAULT):
-        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not SECRET_NAME.search(d)]
         for f in files:
-            if f.endswith(".md"):
+            if f.endswith(".md") and not SECRET_NAME.search(f):
                 yield Path(root) / f
 
 
@@ -66,6 +90,19 @@ def guess_tool(text, tools):
     return "new?"
 
 
+def flagged(line, nxt=""):
+    """True for an explicit tag, or docs-reference plus an action word on this/next line."""
+    if TAG.search(line):
+        return True
+    # a mention that is only a backticked path does not count
+    if not MENTION.search(re.sub(r"`[^`]*`", " ", line)):
+        return False
+    if ACTION.search(line):
+        return True
+    # table rows and folder listings never borrow an action word from the next line
+    return not line.lstrip().startswith("|") and bool(ACTION.search(nxt))
+
+
 def scan(tools):
     items = []
     for p in vault_files():
@@ -75,9 +112,9 @@ def scan(tools):
             continue
         rel = str(p.relative_to(VAULT))
         for i, line in enumerate(lines):
-            if not PATTERN.search(line):
+            if not flagged(line, lines[i + 1] if i + 1 < len(lines) else ""):
                 continue
-            ctx = [l.strip() for l in lines[i:i + 4]]
+            ctx = [redact(l.strip()) for l in lines[i:i + 4]]
             block = "\n".join(ctx)
             # a guess from the flagged line wins over the following context
             tool = guess_tool(line, tools)
@@ -102,13 +139,51 @@ def render(it, today):
     return "\n".join(out) + "\n"
 
 
+def prune(pend):
+    """Rewrite pending.md keeping only items that pass flagged(); returns (kept, dropped)."""
+    text = pend.read_text()
+    head, *blocks = re.split(r"(?m)^(?=- \[[ x]\] )", text)
+    kept, dropped = [], 0
+    for b in blocks:
+        m = re.search(r"\| ([^|\n]+?):(\d+)\s*$", b.splitlines()[0])
+        ok = True
+        if m:
+            try:
+                lines = (VAULT / m.group(1)).read_text(
+                    encoding="utf-8", errors="replace").splitlines()
+                i = int(m.group(2)) - 1
+                ok = flagged(lines[i], lines[i + 1] if i + 1 < len(lines) else "")
+            except (OSError, IndexError):
+                ok = True  # source gone: keep, a human decides
+        if ok:
+            kept.append(b)
+        else:
+            dropped += 1
+    body = head + "".join(kept)
+    if dropped:
+        today = datetime.date.today().isoformat()
+        body = body.rstrip("\n") + (
+            f"\n\nPruned {dropped} path-only mentions on {today} "
+            "(rule: tag or action word)\n")
+        pend.write_text(body)
+    return len(kept), dropped
+
+
 def main():
     ap = argparse.ArgumentParser(description="Collect docs-flagged facts from the vault.")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--prune", action="store_true")
     a = ap.parse_args()
     if not VAULT.is_dir():
         sys.exit(f"vault not found: {VAULT}")
+    if a.prune:
+        pend = LIB / "_inbox" / "pending.md"
+        if not pend.exists():
+            sys.exit("no pending.md")
+        kept, dropped = prune(pend)
+        print(f"kept {kept}, pruned {dropped}")
+        return
     state_f = LIB / "_state" / "inbox-seen.json"
     seen = set()
     if state_f.exists():
