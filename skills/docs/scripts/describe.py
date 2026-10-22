@@ -49,7 +49,7 @@ def tools_by_activity():
 
 def build(description_len):
     tools = tools_by_activity()
-    budget = CAP - description_len - len(HEAD) - len(TAIL) - 4  # quotes, separator slack
+    budget = CAP - description_len - len(HEAD) - len(TAIL) - 40  # the listing adds a " - " separator and trims early
     shown = []
     for i, t in enumerate(tools):
         rest = len(tools) - i - 1
