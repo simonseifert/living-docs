@@ -14,6 +14,8 @@ Usage:
 Provider (OpenAI-compatible, pick with --provider):
     groq      [default]  openai/gpt-oss-120b @ api.groq.com  (fast, free-tier, key=GROQ_API_KEY)
     deepseek             deepseek-chat @ api.deepseek.com     (stronger, bigger inputs, key=DEEPSEEK_API_KEY)
+    local                gpt-oss:20b @ a local Ollama          (free, no key, no request-size cap;
+                         base from $OLLAMA_URL, default http://127.0.0.1:11434/v1)
     --model / --base override either. Keys are read from env or ~/.reach/keys.env.
 
 Why Groq is the default: for this light task (compare a section to a fetched
@@ -39,6 +41,10 @@ KEYS = os.environ.get("REACH_KEYS", str(Path.home() / ".reach" / "keys.env"))
 PROVIDERS = {
     "groq":     {"base": "https://api.groq.com/openai/v1", "model": "openai/gpt-oss-120b", "key_env": "GROQ_API_KEY"},
     "deepseek": {"base": "https://api.deepseek.com/v1",    "model": "deepseek-chat",       "key_env": "DEEPSEEK_API_KEY"},
+    # Ollama's OpenAI-compatible endpoint. Same model family as the Groq default,
+    # small enough for a 16 GB GPU. Ollama ignores the bearer token.
+    "local":    {"base": os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434/v1"),
+                 "model": "gpt-oss:20b", "key_env": None},
 }
 
 
@@ -69,6 +75,10 @@ SYSTEM = (
 )
 
 
+def a_local(base):
+    return "127.0.0.1" in base or "localhost" in base
+
+
 def call(base, model, key, old, fetched, section, tool, max_chars):
     user = (
         f"TOOL: {tool}\nSECTION: {section}\n\n"
@@ -97,7 +107,7 @@ def call(base, model, key, old, fetched, section, tool, max_chars):
     # honor 429 Retry-After for unattended runs; back off on transient 5xx
     for attempt in range(4):
         try:
-            with urllib.request.urlopen(req, timeout=120) as resp:
+            with urllib.request.urlopen(req, timeout=600 if a_local(base) else 120) as resp:
                 data = json.load(resp)
             content = data["choices"][0]["message"]["content"]
             return content, data.get("usage", {})
@@ -127,7 +137,7 @@ def main(argv):
     prov = PROVIDERS[a.provider]
     base = a.base or prov["base"]
     model = a.model or prov["model"]
-    key = load_key(prov["key_env"])
+    key = load_key(prov["key_env"]) if prov["key_env"] else "ollama"
     if not key:
         print(json.dumps({"error": f"no {prov['key_env']} in env or {KEYS}"}), file=sys.stderr)
         return 3

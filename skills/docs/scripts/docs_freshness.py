@@ -49,6 +49,7 @@ def _resolve_ntfy_config():
 
 
 NTFY_CONFIG = _resolve_ntfy_config()
+MAX_TOOLS = 12
 
 
 def _is_status_section(name):
@@ -121,7 +122,19 @@ def main(argv):
 
     if stale:
         title = f"docs: {len(stale)} stale section(s) in {len(by_tool)} tool(s)"
-        lines = [f"- {t}: {', '.join(s)}" for t, s in sorted(by_tool.items())]
+        # ntfy turns bodies over 4 KB into an attachment, and a list of every
+        # tool is noise anyway: show the most-overdue tools, count the rest.
+        def worst(item):
+            return max(int(a.split("/")[0]) if a.split("/")[0].isdigit() else 9999
+                       for a in (x.split("(")[-1] for x in item[1]))
+        ranked = sorted(by_tool.items(), key=worst, reverse=True)
+        lines = []
+        for t, secs in ranked[:MAX_TOOLS]:
+            w = worst((t, secs))
+            age = "never fetched" if w == 9999 else f"oldest {w}d"
+            lines.append(f"- {t}: {len(secs)} section(s), {age}")
+        if len(ranked) > MAX_TOOLS:
+            lines.append(f"... and {len(ranked) - MAX_TOOLS} more (run stale.py for all)")
         body = "\n".join(lines) + "\n\nRefresh with /docs refresh <tool>"
         priority = 3
     else:

@@ -8,8 +8,12 @@ Usage:
     stale.py                 # scan the whole library
     stale.py <tool>          # one tool
     stale.py --json          # machine-readable output
+    stale.py --lint          # check every sources.yaml parses and has the fields stale.py needs
 
-Pure stdlib. TTL may be an int (days) or the string "on-demand" (never stale).
+Pure stdlib (uses PyYAML when installed). TTL may be an int (days) or the
+string "on-demand" (never stale). Accepts the section list under `sections:`
+or the older `sources:` key, as a list of `- name: ...` blocks or a mapping
+keyed by section name.
 Library root defaults to ~/docs-reference, override with
 DOCS_REFERENCE_DIR.
 """
@@ -36,18 +40,46 @@ def _parse_date(v):
     return datetime.date.fromisoformat(str(v).strip())
 
 
-def load_yaml(path):
-    """Minimal YAML loader for the flat sources.yaml shape we emit.
+def load_yaml(path, errors=None):
+    """Load a sources.yaml.
 
     Prefers PyYAML if available; falls back to a small parser that handles
     the top-level scalars and the `sections:` list of `- key: value` blocks.
+    A file PyYAML rejects is still read via the fallback, but the error is
+    recorded in `errors` so --lint can surface it instead of hiding it.
     """
     try:
         import yaml  # type: ignore
+    except ImportError:
+        return _fallback_parse(path)
+    try:
         with open(path) as f:
             return yaml.safe_load(f)
-    except Exception:
+    except Exception as e:
+        if errors is not None:
+            errors.append(f"invalid YAML: {str(e).splitlines()[0]} "
+                          f"({' '.join(str(e).split()[-4:])})")
         return _fallback_parse(path)
+
+
+def get_sections(data):
+    """Normalize the section list to a list of dicts with a `name`."""
+    if not isinstance(data, dict):
+        return []
+    secs = data.get("sections")
+    if not secs:
+        secs = data.get("sources")
+    if isinstance(secs, dict):
+        out = []
+        for k, v in secs.items():
+            if isinstance(v, dict):
+                v = dict(v)
+                v.setdefault("name", k)
+                out.append(v)
+        return out
+    if isinstance(secs, list):
+        return [x for x in secs if isinstance(x, dict)]
+    return []
 
 
 def _val(v):
@@ -82,7 +114,7 @@ def _fallback_parse(path):
             if ":" in s:
                 k, _, v = s.partition(":")
                 k, v = k.strip(), _val(v)
-                if k == "sections":
+                if k in ("sections", "sources"):
                     continue
                 if indent >= 2 and cur is not None:
                     cur[k] = v
@@ -98,7 +130,7 @@ def check_tool(tool_dir):
         return None
     data = load_yaml(sp) or {}
     rows, today = [], _today()
-    for sec in data.get("sections", []) or []:
+    for sec in get_sections(data):
         name = sec.get("name", "?")
         ttl = sec.get("ttl_days", None)
         status = sec.get("status", "ok")
@@ -112,7 +144,45 @@ def check_tool(tool_dir):
             rows.append((name, status, f"{age}/{ttl_i}d", age - ttl_i, age > ttl_i))
         except Exception:
             rows.append((name, status, f"?/{ttl}", None, True))
-    return {"tool": data.get("tool", tool_dir.name), "rows": rows}
+    tool = data.get("tool", tool_dir.name) if isinstance(data, dict) else tool_dir.name
+    return {"tool": tool, "rows": rows}
+
+
+def lint(tool_dirs):
+    """Report manifests stale.py cannot fully trust. Exit 1 if any problem."""
+    problems = 0
+    for d in tool_dirs:
+        sp = d / "sources.yaml"
+        if not sp.exists():
+            print(f"{d.name}: no sources.yaml (brief can never go stale)")
+            problems += 1
+            continue
+        errs = []
+        data = load_yaml(sp, errs) or {}
+        secs = get_sections(data)
+        if not secs:
+            errs.append("no sections found (expected `sections:` list)")
+        elif isinstance(data, dict) and "sections" not in data:
+            errs.append("uses old `sources:` key, rename to `sections:`")
+        for sec in secs:
+            missing = [k for k in ("name", "url", "last_fetched", "ttl_days") if k not in sec]
+            if missing:
+                errs.append(f"section {sec.get('name', '?')}: missing {', '.join(missing)}")
+                continue
+            if sec["last_fetched"] in (None, ""):
+                errs.append(f"section {sec['name']}: never fetched (counts as stale)")
+            elif str(sec["ttl_days"]) not in ("on-demand", "on_demand"):
+                try:
+                    _parse_date(sec["last_fetched"])
+                    int(sec["ttl_days"])
+                except Exception:
+                    errs.append(f"section {sec['name']}: bad last_fetched/ttl_days")
+        for e in errs:
+            print(f"{d.name}: {e}")
+        problems += bool(errs)
+    print(f"\n{problems} of {len(tool_dirs)} manifests need attention." if problems
+          else f"All {len(tool_dirs)} manifests OK.")
+    return 1 if problems else 0
 
 
 def main(argv):
@@ -127,6 +197,9 @@ def main(argv):
     else:
         tool_dirs = sorted(p for p in LIB.iterdir()
                            if p.is_dir() and not p.name.startswith((".", "_")))
+
+    if "--lint" in argv:
+        return lint(tool_dirs)
 
     results = [r for r in (check_tool(d) for d in tool_dirs) if r]
 

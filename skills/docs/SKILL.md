@@ -1,7 +1,7 @@
 ---
 name: docs
 description: Build and maintain a local, living reference brief for ANY tool/service/API/SDK in a project's stack (GHL, n8n, Apify, Supabase, Next.js, Stripe, anything). Fetches far more than API docs: features, pricing/plans, changelog/news, status, available agents/actors/integrations, gotchas, and curated public community resources (docs, forums, Reddit, YouTube, guides), then writes an agent-facing markdown brief plus a machine-readable sources manifest with managed freshness. Use when the user says "learn <tool>", "research our stack", "know <tool> inside out", "fetch the latest docs for <tool>", "build a reference for <tool>", "what can <tool> do", "refresh the <tool> brief", or when starting work with any tool/service in the stack. Invoke it proactively whenever the current task is actually about a specific tool (build or open its brief, or refresh it if stale); the only thing to avoid is wiring it as a global per-session hook.
-trigger: /docs
+argument-hint: "<tool> | refresh <tool> | --stale | --lint | list | import <tool> <path>"
 ---
 
 # /docs: living reference briefs for any tool in the stack
@@ -35,6 +35,7 @@ Invoke when the user asks to learn, research, or reference a tool in the project
 /docs refresh <tool> --section pricing,changelog,status   # refresh specific sections
 /docs refresh <tool> --all       # force full refresh regardless of TTL
 /docs --stale                    # list every brief with per-section staleness (runs scripts/stale.py)
+/docs --lint                     # check every sources.yaml parses and has the fields stale.py needs
 /docs list                       # list all briefs in the library
 /docs import <tool> <path>       # adopt an existing hand-written guide as a managed brief (generates its sources.yaml)
 ```
@@ -49,7 +50,7 @@ If no explicit sub-command is given, treat a bare `/docs <tool>` as: open the br
     - `brief.md`: the condensed, agent-facing guide (the thing you read)
     - `sources.yaml`: machine-readable source map + freshness (the thing you refresh from)
     - `full/`: raw dumps for drill-down only (llms-full.txt, openapi.json, actor catalog json). Never loaded wholesale into context.
-  - `INDEX.md`: catalog of all briefs with last-verified dates
+  - `INDEX.md`: catalog of all briefs with last-verified dates. Keep each row's Notes to one or two sentences (under ~40 words); the long story of a build goes in `<tool>/history.md`, not the index.
 
 Keep the library in a plain directory sub-agents can write (a normal git repo). Avoid note apps or cloud-synced folders that block subprocess writes on macOS; if you want a copy there, mirror it from the main session. Sub-agents never write to a restricted path.
 
@@ -59,7 +60,7 @@ Keep the library in a plain directory sub-agents can write (a normal git repo). 
 2. **Lean on what already exists.** For live API/library docs, prefer a first-party MCP if one is connected (Vercel, Supabase, Cloudflare, AWS, Microsoft Learn, Hugging Face, GitHub), then Context7, then the tool's `llms.txt`. Do not re-scrape docs a connected tool already serves. The brief's value-add is everything those do NOT cover.
 3. **Secrets are placeholders, always.** Never write a real API key, token, PIT, locationId, or account ID into a brief or `full/`. Use `pit-xxxx`, `<locationId>`, `<api-key>`. The library is git-tracked.
 4. **Preserve operator rules.** If the user has a standing rule about a tool (for example "this CRM is manual-only, never let an agent write to a live account"), reproduce it as a prominent callout at the top of that tool's brief. Briefs are reference, not an automation green-light.
-5. **Community: scrape what's open, search what's gated (v2).** Actively pull the open public layer, do not just link it: news/blogs (RSS or scrape), the vendor's help center / knowledge base (crawl every article into `full/`, see the KB-crawl recipe in the playbook), changelog feeds, and YouTube (channel RSS). For Reddit and other search-indexed social, use the `last30days` skill or WebSearch, because raw anonymous Reddit is usually IP-blocked from a datacenter (its `.rss`/`.json` can return a "Blocked" page even on HTTP 200). Only genuinely login-walled content (private Facebook groups, member Slack/Discord history, gated dashboards) is left as `auth-required` in sources.yaml. Never bypass an auth wall.
+5. **Community: scrape what's open, search what's gated (v2).** Actively pull the open public layer, do not just link it: news/blogs (RSS or scrape), the vendor's help center / knowledge base (crawl every article into `full/`, see the KB-crawl recipe in the playbook), changelog feeds, and YouTube (channel RSS). For Reddit and other search-indexed social, use the `last30days` skill, WebSearch, or `reach web <reddit thread URL>` (renders in local Chromium), because raw anonymous Reddit is usually IP-blocked from a datacenter (its `.rss`/`.json` can return a "Blocked" page even on HTTP 200). Only genuinely login-walled content (private Facebook groups, member Slack/Discord history, gated dashboards) is left as `auth-required` in sources.yaml. Never bypass an auth wall.
 6. **Every fact gets a source and a date.** Anything in the brief that can go stale (pricing, limits, endpoints, version-specific behavior) maps to an entry in `sources.yaml` with `url` + `last_fetched`. If you cannot source it, mark it `unverified`.
 
 ## Build algorithm
@@ -84,7 +85,7 @@ Follow `references/discovery-playbook.md` for the full per-surface how-to. Summa
 
 **5. Synthesize the brief** using `references/brief-template.md`. Curate hard. Cross-reference the gold-standard example at `references/example-brief.md` for depth and tone (deep feature dives, API auth/limits/endpoints, pitfalls, troubleshooting, a field-experience layer).
 
-**6. Write `sources.yaml`** using `references/sources-schema.md`: one entry per section with `url`, `method`, `last_fetched`, `ttl_days`, `status` (ok | partial | auth-required | unverified).
+**6. Write `sources.yaml`** using `references/sources-schema.md`: one entry per section under a top-level `sections:` list (not `sources:`), each with `name`, `url`, `method`, `last_fetched`, `ttl_days`, `status` (ok | partial | auth-required | unverified). Quote any value that contains `: ` or starts with a special character. Then run `scripts/stale.py --lint <tool>`; it must report no problems before you commit. Invalid YAML or the wrong key silently breaks staleness checks.
 
 **7. Append to the history log, update `INDEX.md`, commit.** Prepend a dated entry to `<tool>/history.md` (create it on first build) summarizing what this run did: date, versions/prices verified, sections written or changed. Add the same one-liner to the top-level `CHANGELOG.md` under today's date. Then `cd ~/docs-reference && git add <tool> INDEX.md CHANGELOG.md && git commit -m "docs: <build|refresh> <tool>"`. Confirm the commit; do not push unless the user asks.
 
@@ -95,14 +96,14 @@ spends a model, and that model is a cheap one, never the agent's own tokens.
 
 1. Read the tool's `sources.yaml`. Compute staleness per section (`now - last_fetched` vs `ttl_days`). `scripts/stale.py <tool>` does this. (Free.)
 2. Re-fetch only stale sections (or the ones named in `--section`). Cheap first: poll the change_detector (OpenAPI version string, RSS pubDate, GitHub release tag) before re-scraping anything. Fetch with `reach`.
-3. **Compare with a cheap model, not the agent.** `scripts/groq_refresh.py --old <section>.md --fetched <slice>.md --section <name> --tool <tool>` sends the current section plus the freshly-fetched source to an OpenAI-compatible cheap model (Groq `openai/gpt-oss-120b` by default; `--provider deepseek` for stronger judgment or bigger inputs) and returns JSON `{changed, summary, updated_section}`. Send a focused slice of the source, not the whole page (Groq caps request size). Apply `updated_section` only when `changed` is true.
+3. **Compare with a cheap model, not the agent.** `scripts/groq_refresh.py --old <section>.md --fetched <slice>.md --section <name> --tool <tool>` sends the current section plus the freshly-fetched source to an OpenAI-compatible cheap model (Groq `openai/gpt-oss-120b` by default; `--provider local` for a free `gpt-oss:20b` on your own Ollama with no request-size cap; `--provider deepseek` for stronger judgment or bigger inputs) and returns JSON `{changed, summary, updated_section}`. Send a focused slice of the source, not the whole page (Groq caps request size). Apply `updated_section` only when `changed` is true.
 4. Restamp `last_fetched` (and flip `status` to `ok`) for every section you re-verified, including the ones that did not change.
 5. **Log the changes.** Prepend a dated entry to `<tool>/history.md` listing exactly what moved (e.g. "pricing Starter $20 -> $24; n8n 2.28 -> 2.29; status/community restamped, no change"). If nothing changed, log "checked, no change". Mirror a one-liner into `CHANGELOG.md`.
 6. Commit with `git commit -m "docs: refresh <tool> (<sections>)"`.
 
 ### Weekly freshness ping (optional)
 
-`scripts/docs_freshness.py` runs `stale.py` and sends ONE ntfy notification listing the content-stale sections, so you learn what drifted instead of checking by hand. It is model-free (detection only, zero cost) and skips live `status` sections by default (`ttl_days: 1` means they always read as stale, which is noise). Point it at an ntfy config (see `examples/ntfy.example.json`) via `$DOCS_NTFY_CONFIG`, then schedule it with launchd or cron. Refreshing stays your call: the ping tells you which tool to run `/docs refresh` on.
+`scripts/docs_freshness.py` runs `stale.py` and sends ONE ntfy notification listing the most-overdue tools (capped at 12 lines, since ntfy turns bodies over 4 KB into attachments), so you learn what drifted instead of checking by hand. It is model-free (detection only, zero cost) and skips live `status` sections by default (`ttl_days: 1` means they always read as stale, which is noise). Point it at an ntfy config (see `examples/ntfy.example.json`) via `$DOCS_NTFY_CONFIG`, then schedule it with launchd or cron. Refreshing stays your call: the ping tells you which tool to run `/docs refresh` on.
 
 ## Audit trail (what is tracked)
 
@@ -116,7 +117,7 @@ Default TTLs (override per tool in sources.yaml): status 1d, changelog/news 7d, 
 
 ## Composes these installed capabilities
 
-Context7 MCP (live library docs) · first-party MCPs (Vercel/Supabase/Cloudflare/AWS/Microsoft Learn/Hugging Face/GitHub) · **`reach`** (server-less fetch CLI, the primary web backend: `web` = JS clean-read via Jina, `search` = Exa, `repo-wiki` = DeepWiki, `yt`, `rss`, `repo` = gh, `crawl` = Firecrawl tier-5; no MCP servers, `reach doctor` for status) · **`agent-reach`** (only for gated social: Reddit/X/IG/FB via a cookie backend behind a burner profile) · `last30days` / `deep-research` (community sentiment) · `WebSearch`/`WebFetch` · GitHub MCP (releases/issues/discussions). Orchestrate these; do not reimplement them.
+Context7 MCP (live library docs) · first-party MCPs (Vercel/Supabase/Cloudflare/AWS/Microsoft Learn/Hugging Face/GitHub) · **`reach`** (server-less fetch CLI, the primary web backend: `web` = Jina, then a free local Chromium render, then Firecrawl, then curl; `search` = Exa, then SearXNG; `repo-wiki` = DeepWiki, `yt`, `rss`, `repo` = gh, `crawl` = Firecrawl; no MCP servers. Paid backends run out of credits, so run `reach doctor` before a big build and lean on the free tiers) · **`agent-reach`** (only for gated social: Reddit/X/IG/FB via a cookie backend behind a burner profile) · `last30days` / `deep-research` (community sentiment) · `WebSearch`/`WebFetch` · GitHub MCP (releases/issues/discussions). Orchestrate these; do not reimplement them.
 
 ## References (load on demand)
 
