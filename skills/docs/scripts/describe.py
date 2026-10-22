@@ -27,10 +27,9 @@ LIB = Path(os.environ.get(
 ))
 SKILL = Path(__file__).resolve().parent.parent / "SKILL.md"
 CAP = 1536
-HEAD = ('Local briefs exist for these tools, so open (or search) the brief BEFORE '
-        'WebSearch, Context7 or guessing whenever a question or task involves one: ')
-TAIL = ('. Also: "learn/research/refresh <tool>", or any new tool worth a brief. '
-        'Never wire it into a session-start hook.')
+HEAD = ('Load this skill BEFORE WebSearch/Context7 whenever a question or task involves '
+        'a tool with a local brief (fastest: `docs-search "<terms>" --tool <tool>`): ')
+TAIL = ('. Also "learn/refresh <tool>" or a new tool worth a brief. No session-start hooks.')
 
 
 def tools_by_activity():
