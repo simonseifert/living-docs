@@ -8,10 +8,12 @@ description: >-
   yt-dlp, gh, Firecrawl), with NO MCP servers and NO background daemons (zero
   RAM footprint). Use when you need to fetch or search public internet content
   from the command line. Also does account-safe social with no cookies:
-  Instagram, Reddit, and public X data (via Apify Actors). Is the single front
-  door for fetching: LinkedIn and public X run cookie-free through Apify Actors;
-  cookie-gated deep social (Facebook, and X with a session) routes to
-  `agent-reach` under the hood (needs a burner Chrome profile).
+  LinkedIn profiles/companies/posts (HarvestAPI), Instagram, TikTok and Facebook
+  page posts (ScrapeCreators), Google Maps reviews (Bright Data), Reddit and
+  public X (Apify Actors), each printing which vendor answered and what it cost.
+  Is the single front door for fetching; cookie-gated deep social (Facebook
+  search, and X with a session) routes to `agent-reach` under the hood (needs a
+  burner Chrome profile).
 trigger: /reach
 ---
 
@@ -32,7 +34,10 @@ reach psearch <query>       Perplexity Search API, cited results                
 reach yt <url>              YouTube metadata + auto transcript (yt-dlp)                 [keyless]
 reach rss <feed-url>        latest ~15 items from an RSS/Atom feed                      [keyless]
 reach repo <org/repo>       GitHub metadata + README (gh)                              [keyless, uses gh auth]
-reach instagram <user>      Instagram posts (Apify actor, no cookies/account risk)     [needs APIFY_TOKEN]
+reach instagram <user> [n]  Instagram posts: ScrapeCreators -> Apify                   [SCRAPECREATORS_API_KEY / APIFY_TOKEN]
+reach tiktok <user> [n]     TikTok videos with plays/likes/shares (ScrapeCreators)     [SCRAPECREATORS_API_KEY]
+reach facebook-page <page> [n] Facebook PAGE posts (ScrapeCreators, no cookies)        [SCRAPECREATORS_API_KEY]
+reach reviews <maps-url> [days] Google Maps reviews (Bright Data, async, slow)         [BRIGHTDATA_API_KEY]
 reach reddit <query>        Reddit search (scope with r/<sub> <query>), no cookies       [uses APIFY_TOKEN]
 reach x-public <query>      Public X search (Apify Actor, no cookies)                 [uses APIFY_TOKEN]
 reach x-public user <handle> Public X timeline (Apify Actor, no cookies)                [uses APIFY_TOKEN]
@@ -40,15 +45,45 @@ reach x-followers <handle>  Public followers/following (Apify Actor)            
 reach doc <file>            Word/PPT/Excel/PDF/EPUB/ODF/RTF/CSV -> markdown             [keyless, local]
 reach transcribe <audio>    audio/podcast/video -> text (self-hosted whisper.cpp, Groq fallback) [WHISPER_SERVER_URL / GROQ_API_KEY]
 reach x <query>             X/Twitter (routes to agent-reach)                          [needs burner setup]
-reach linkedin <url>        LinkedIn profile or company (Apify, no cookies)            [APIFY_TOKEN]
-reach linkedin posts <url>  LinkedIn post history w/ engagement (Apify, no cookies)    [APIFY_TOKEN]
-reach facebook <query>      Facebook (routes to agent-reach)                           [needs burner setup]
+reach linkedin <url>        LinkedIn profile or company: HarvestAPI -> Apify            [HARVESTAPI_KEY / APIFY_TOKEN]
+reach linkedin posts <url>  LinkedIn post history w/ engagement: HarvestAPI -> Apify   [HARVESTAPI_KEY / APIFY_TOKEN]
+reach facebook <query>      Facebook search (routes to agent-reach)                    [needs burner setup]
 reach crawl map <domain>    discover a site's URLs (Firecrawl)                         [uses credits]
 reach crawl site <url>      managed JS crawl to markdown (Firecrawl)                   [uses credits]
-reach doctor                what works right now
+reach doctor                what works right now, with each vendor's live balance
 ```
 
-`reach` is the **single front door**: each command auto-picks its backend, so callers never choose a tool. `linkedin` and `x-public` run through Apify Actors with no cookie and no account, so they cannot get an account restricted. The remaining cookie-gated platforms (`facebook`, and `x` for logged-in depth) route to `agent-reach`; until a burner Chrome profile + logins exist, those print the exact enable step instead of failing silently.
+`reach` is the **single front door**: each command auto-picks its backend, so callers never choose a tool. The social routes use keyed vendor APIs with no cookie and no account, so they cannot get an account restricted. The remaining cookie-gated platforms (`facebook`, and `x` for logged-in depth) route to `agent-reach`; until a burner Chrome profile + logins exist, those print the exact enable step instead of failing silently.
+
+## Which tool and vendor for what
+
+| Question | Use |
+|---|---|
+| Who is this person / company? | `intel` (`intel linkedin <url>` for one LinkedIn profile, corpus first) |
+| What does an account publish, what works, how does it compare? | corpus, via `intel content ...` (stored, reusable, audited) |
+| A quick one-off look: a page, a few recent posts, a transcript | `reach` |
+
+| Platform | Preferred vendor, cost | Fallback | Commands |
+|---|---|---|---|
+| LinkedIn profile / company | HarvestAPI, $0.004 per lookup | Apify actor | `reach linkedin`, `intel linkedin` |
+| LinkedIn posts | HarvestAPI, $0.004 per page of ~100 | Apify actor | `reach linkedin posts`, `intel content` |
+| Instagram posts | ScrapeCreators, 1 credit (~$0.002) per 12 posts | Apify actor | `reach instagram`, `intel content` |
+| TikTok videos | ScrapeCreators, 1 credit per 10 | none | `reach tiktok`, `intel content` |
+| Facebook page posts | ScrapeCreators, 1 credit per 3 | none | `reach facebook-page`, `intel content` |
+| YouTube | yt-dlp, free | | `reach yt`, `intel content` (Shorts) |
+| Google Maps reviews | Bright Data, 1 credit per record (5k free/month), ~10 min | none | `reach reviews` (first live run returned an error record: treat as experimental) |
+| Reddit, public X | Apify actors | | `reach reddit`, `reach x-public` |
+
+**Balances:** `reach doctor` shows HarvestAPI dollars, ScrapeCreators credits, the Apify
+plan/cap and whether Bright Data accepts jobs (all free reads); `intel content health`
+checks the corpus pipeline. Check before a large job and whenever a result looks empty.
+
+**Every result states its source and cost.** `reach` prints `reach: served by <vendor>`
+and `charged $X` / `N credit(s)` on stderr; `intel` prints `# source: <vendor> (paid,
+$X), as of <date>` (`vendor` and `cost_usd` in `--json`). Carry vendor, cost and as-of
+date into whatever you hand back. A private or missing target does not fall back to a
+second vendor (it would bill for the same miss). `REACH_PAGES=1..5` (default 1) caps
+billed pages per call; `REACH_BD_MAX` caps Bright Data records (default 20).
 
 ## Design rules
 

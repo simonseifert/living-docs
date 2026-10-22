@@ -131,16 +131,19 @@ reach repo-wiki <org/repo>  DeepWiki explainer of how a codebase actually works
 reach yt <url>              YouTube metadata + transcript
 reach rss <feed>            latest items from a feed
 reach repo <org/repo>       GitHub metadata + README
-reach instagram <user>      public Instagram posts through Apify
+reach instagram <user>      public Instagram posts (ScrapeCreators, Apify fallback)
+reach tiktok <user>         public TikTok videos (ScrapeCreators)
+reach facebook-page <page>  public Facebook page posts (ScrapeCreators)
+reach reviews <maps-url>    Google Maps reviews (Bright Data, async)
 reach reddit <query>        public Reddit search through Apify
 reach x-public <query>      public X search (Apify Actor, no cookies)
 reach x-followers <handle>  public X audience relations (Apify Actor)
 reach x <query>             deeper X access through agent-reach and a burner profile
-reach linkedin <url>        LinkedIn profile, company or posts (Apify, no cookies)
+reach linkedin <url>        LinkedIn profile, company or posts (HarvestAPI, Apify fallback)
 reach doc <file>            local Word/PPT/Excel/PDF/EPUB -> markdown, keyless
 reach transcribe <audio>    audio/video -> text (self-hosted whisper.cpp, Groq fallback)
 reach crawl map|site        managed JS crawl (Firecrawl) for the hard cases
-reach doctor                what works right now
+reach doctor                what works right now, with live vendor balances
 ```
 
 `repo-wiki` is worth calling out: it pulls a [DeepWiki](https://deepwiki.com) explainer of a

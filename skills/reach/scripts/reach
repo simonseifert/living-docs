@@ -3,6 +3,7 @@
 # Direct HTTP APIs + already-installed CLIs. No MCP servers, no daemons, no RAM footprint.
 # Keys and endpoints (all optional) live in ~/.reach/keys.env, outside the repo:
 #   EXA_API_KEY JINA_API_KEY FIRECRAWL_API_KEY APIFY_TOKEN GROQ_API_KEY PERPLEXITY_API_KEY
+#   HARVESTAPI_KEY (LinkedIn) SCRAPECREATORS_API_KEY (IG/TikTok/FB) BRIGHTDATA_API_KEY (reviews)
 #   SEARXNG_URL (self-hosted search)  WHISPER_SERVER_URL (self-hosted whisper.cpp server)
 # Cookie-backed social still routes through `agent-reach`; public Actor routes run directly.
 set -uo pipefail
@@ -57,12 +58,71 @@ _apify_items() { # $1=actor id with ~ separator  $2=input JSON
   # --max-time here sits just ABOVE 300 to outlive the server's own limit.
   # Anything that genuinely needs longer must start async and poll instead.
   [ -n "${APIFY_TOKEN:-}" ] || { echo "reach: APIFY_TOKEN not set in $KEYS" >&2; return 3; }
-  curl -fsS --max-time 310 -X POST \
+  local tmp code; tmp="$(mktemp)"
+  code="$(curl -sS --max-time 310 -o "$tmp" -w '%{http_code}' -X POST \
     "https://api.apify.com/v2/acts/$1/run-sync-get-dataset-items" \
     -H "Authorization: Bearer $APIFY_TOKEN" \
     -H "Content-Type: application/json" \
-    -d "$2"
+    -d "$2")"
+  case "$code" in
+    2*) cat "$tmp"; rm -f "$tmp" ;;
+    *)  # 403 "Too many outstanding invoices" / 402 cap: name it, never look like "no results"
+        echo "reach: apify HTTP ${code:-000} on $1: $(jq -r '.error.message // .error // empty' "$tmp" 2>/dev/null | head -c 160)" >&2
+        rm -f "$tmp"; return 1 ;;
+  esac
 }
+
+# --- direct social-data vendors (cheaper than Apify for the same data, no cookies) ---
+# Every call is bounded (REACH_PAGES, 1..5 pages, default 1) and prints what it cost
+# on stderr when the vendor says so. HarvestAPI returns `cost` (USD) per response;
+# ScrapeCreators returns `credits_remaining`. Media URLs in the output are signed
+# and expire (IG ~1-4 days), so do not store them as permanent links.
+_pages() {
+  local p="${REACH_PAGES:-1}"
+  [[ "$p" =~ ^[1-5]$ ]] || { echo "reach: REACH_PAGES must be 1..5 (each page is billed)" >&2; return 2; }
+  printf '%s' "$p"
+}
+_vendor_get() { # $1=vendor label $2=url $3=auth header, rest: name=value params. Body on stdout.
+  # Returns 0 on HTTP 200 without a top-level error, 1 on a vendor/transport failure
+  # (caller falls back), 5 when the vendor answered but the target itself is the
+  # problem (private / not found): another vendor would fail the same way, and bill.
+  local label="$1" url="$2" auth="$3"; shift 3
+  local args=() kv; for kv in "$@"; do args+=(--data-urlencode "$kv"); done
+  local tmp code; tmp="$(mktemp)"
+  code="$(curl -sS -G --max-time 120 -o "$tmp" -w '%{http_code}' -H "$auth" "${args[@]}" "$url" 2>/dev/null)"
+  local body; body="$(cat "$tmp")"; rm -f "$tmp"
+  local msg; msg="$(printf '%s' "$body" | jq -r '(.error | if type=="object" then .error // .message else . end) // .message // empty' 2>/dev/null | head -c 160)"
+  case "$code" in
+    200) if printf '%s' "$body" | jq -e '(.error // null) == null' >/dev/null 2>&1; then printf '%s' "$body"; return 0; fi
+         echo "reach: $label: ${msg:-error in a 200 body}" >&2; return 5 ;;
+    401) echo "reach: $label: key rejected (401)" >&2; return 1 ;;
+    402) echo "reach: $label: out of credits (402), check with: reach doctor" >&2; return 1 ;;
+    403|404) echo "reach: $label: $code ${msg:-target unavailable}" >&2; return 5 ;;
+    *)   echo "reach: $label: HTTP ${code:-000} ${msg}" >&2; return 1 ;;
+  esac
+}
+_hv() { # HarvestAPI GET: $1=path, rest params. Prints the cost line on stderr.
+  [ -n "${HARVESTAPI_KEY:-}" ] || { echo "reach: harvestapi: HARVESTAPI_KEY not set in $KEYS" >&2; return 1; }
+  local p="$1"; shift
+  local out rc; out="$(_vendor_get harvestapi "https://api.harvestapi.io$p" "X-API-Key: $HARVESTAPI_KEY" "$@")"; rc=$?
+  [ $rc = 0 ] || return $rc
+  printf '%s' "$out" | jq -r '"reach: harvestapi charged $\(.cost // "?") (\((.payments // []) | join(",")))"' >&2 2>/dev/null
+  printf '%s' "$out"
+}
+_sc() { # ScrapeCreators GET: $1=path, rest params. Prints the credit line on stderr.
+  [ -n "${SCRAPECREATORS_API_KEY:-}" ] || { echo "reach: scrapecreators: SCRAPECREATORS_API_KEY not set in $KEYS" >&2; return 1; }
+  local p="$1"; shift
+  local out rc; out="$(_vendor_get scrapecreators "https://api.scrapecreators.com$p" "x-api-key: $SCRAPECREATORS_API_KEY" "$@")"; rc=$?
+  [ $rc = 0 ] || return $rc
+  # A private / restricted profile comes back as success:true with HTTP 200-ish
+  # fields errorStatus/message and 0 credits charged: surface it, do not fall back.
+  if printf '%s' "$out" | jq -e '.errorStatus // (.success == false)' >/dev/null 2>&1; then
+    echo "reach: scrapecreators: $(printf '%s' "$out" | jq -r '.message // .error // "target unavailable"')" >&2; return 5
+  fi
+  printf '%s' "$out" | jq -r '"reach: scrapecreators charged \(.credits_charged // 1) credit(s)" + (if .credits_remaining then ", \(.credits_remaining) left" else "" end)' >&2 2>/dev/null
+  printf '%s' "$out"
+}
+_sc_total() { [ "${1:-0}" -gt 0 ] && echo "reach: served by scrapecreators, $1 page(s) = $1 credit(s) total" >&2; }
 
 _offer_browser() { # the Chromium tier's browser is missing: ask on a terminal, hint otherwise
   if [ -t 0 ] && [ -t 2 ]; then
@@ -227,11 +287,33 @@ for it in items[:15]:
     echo "--- README (head) ---"
     gh api "repos/$1/readme" -H "Accept: application/vnd.github.raw" 2>/dev/null | sed -n '1,60p' ;;
 
-  instagram|ig) # reach instagram <username|url> [limit]   (Apify actor, no cookies / no account risk)
+  instagram|ig) # reach instagram <username|url> [limit]   (ScrapeCreators -> Apify, no cookies / no account risk)
     [ $# -ge 1 ] || { echo "usage: reach instagram <username|url> [limit]" >&2; exit 2; }
-    [ -n "${APIFY_TOKEN:-}" ] || { echo "reach: APIFY_TOKEN not set in $KEYS" >&2; exit 3; }
     case "$1" in http*) url="$1";; *) url="https://www.instagram.com/${1#@}/";; esac
-    lim="${2:-8}"
+    handle="${url#*instagram.com/}"; handle="${handle%%[/?]*}"
+    lim="${2:-12}"; [[ "$lim" =~ ^[0-9]+$ ]] && [ "$lim" -ge 1 ] && [ "$lim" -le 60 ] || { echo "reach: limit must be 1..60" >&2; exit 2; }
+    # 1) ScrapeCreators: 1 credit per 12 posts. Pages = ceil(limit/12), capped by REACH_PAGES.
+    maxp="$(_pages)" || exit $?; want=$(( (lim + 11) / 12 )); [ "$want" -gt "$maxp" ] && want="$maxp"
+    pd="$(mktemp -d)"; trap 'rm -rf "$pd"' EXIT
+    cur=""; n=0; rc=0
+    while [ "$n" -lt "$want" ]; do
+      if [ -n "$cur" ]; then _sc /v2/instagram/user/posts "handle=$handle" "next_max_id=$cur" trim=true >"$pd/$n.json"; rc=$?
+      else _sc /v2/instagram/user/posts "handle=$handle" trim=true >"$pd/$n.json"; rc=$?; fi
+      [ $rc = 0 ] || { rm -f "$pd/$n.json"; break; }
+      cur="$(jq -r 'if .more_available then .next_max_id // empty else empty end' "$pd/$n.json")"
+      n=$((n + 1)); [ -n "$cur" ] || break
+    done
+    if [ "$n" -gt 0 ]; then
+      _sc_total "$n"
+      jq -rs --argjson n "$lim" '
+        ((.[0].user // .[0].items[0].user // {}) | "## @\(.username // "?") | \(.full_name // "") | followers:\(.follower_count // "?") posts:\(.media_count // "?")"),
+        ([.[].items // [] | .[]] | .[:$n][] | "- \({"1":"image","2":"video","8":"carousel"}[(.media_type // 0)|tostring] // "post") | \((.taken_at // 0) | todate) | hearts:\(.like_count // 0) comments:\(.comment_count // 0)\(if .play_count then " plays:\(.play_count)" else "" end)\n  https://www.instagram.com/p/\(.code)/\n  \((.caption.text // "") | gsub("\\s+";" ") | .[0:200])")' "$pd"/*.json
+      exit 0
+    fi
+    [ $rc = 5 ] && exit 1   # private / unavailable: Apify would fail the same way, and bill
+    # 2) Apify fallback (apify~instagram-scraper).
+    [ -n "${APIFY_TOKEN:-}" ] || { echo "reach: APIFY_TOKEN not set in $KEYS (Apify fallback)" >&2; exit 3; }
+    echo "reach: falling back to Apify (apify~instagram-scraper)" >&2
     curl -s --max-time 310 -X POST "https://api.apify.com/v2/acts/apify~instagram-scraper/run-sync-get-dataset-items" \
       -H "Authorization: Bearer $APIFY_TOKEN" \
       -H "Content-Type: application/json" \
@@ -348,14 +430,45 @@ except Exception as exc:
     # Input keys come from the Actor's own schema, not from guessing -- a wrong key
     # makes the run SUCCEED with an empty dataset instead of erroring:
     #   GET /v2/acts/<actor>/builds/default/openapi.json
+    #
+    # HarvestAPI's direct API (same company, same payload as its Apify Actors) is tried
+    # first: $0.004 per profile/company lookup or per ~100-post page (measured
+    # 2026-10-23), no Apify plan needed. Apify is the fallback.
     [ $# -ge 1 ] || { echo "usage: reach linkedin <profile-url> | reach linkedin posts <profile-url>" >&2; exit 2; }
     lim="$(_apify_limit)" || exit $?
     if [ "$1" = posts ]; then
       [ $# -eq 2 ] || { echo "usage: reach linkedin posts <profile-url>" >&2; exit 2; }
+      case "$2" in *"/company/"*) hp=/linkedin/company-posts; hk=company ;; *) hp=/linkedin/profile-posts; hk=profile ;; esac
+      maxp="$(_pages)" || exit $?
+      pd="$(mktemp -d)"; trap 'rm -rf "$pd"' EXIT
+      tok=""; n=0; rc=0; got=0
+      while [ "$n" -lt "$maxp" ] && [ "$got" -lt "$lim" ]; do
+        if [ -n "$tok" ]; then _hv "$hp" "$hk=$2" "page=$((n + 1))" "paginationToken=$tok" >"$pd/$n.json"; rc=$?
+        else _hv "$hp" "$hk=$2" >"$pd/$n.json"; rc=$?; fi
+        [ $rc = 0 ] || { rm -f "$pd/$n.json"; break; }
+        c="$(jq '.elements // [] | length' "$pd/$n.json")"; got=$((got + c))
+        tok="$(jq -r '.pagination.paginationToken // empty' "$pd/$n.json")"
+        n=$((n + 1)); { [ "$c" -gt 0 ] && [ -n "$tok" ]; } || break
+      done
+      if [ "$n" -gt 0 ]; then
+        jq -rs '"reach: served by harvestapi, \(length) page(s), $\([.[].cost // 0] | add * 1000 | round / 1000) total"' "$pd"/*.json >&2
+        jq -cs --argjson n "$lim" '[.[].elements // [] | .[]] | .[:$n][]' "$pd"/*.json
+        exit 0
+      fi
+      [ $rc = 5 ] && exit 1
+      echo "reach: falling back to Apify (harvestapi~linkedin-profile-posts)" >&2
       input="$(jq -n --arg u "$2" --argjson n "$lim" \
         '{targetUrls:[$u], maxPosts:$n, scrapeReactions:false, scrapeComments:false}')"
       _apify_items "harvestapi~linkedin-profile-posts" "$input" | jq -c '.[]'
     else
+      case "$1" in http*) ;; *) echo "reach: pass a full profile/company URL, or 'posts <url>'" >&2; exit 2 ;; esac
+      # main=true is the short profile ($0.004, "linkedinProfileShort"); the full
+      # profile is a pricier tier. Output is the bare record, like the Actor's.
+      case "$1" in *"/company/"*) out="$(_hv /linkedin/company "query=$1")" ;; *) out="$(_hv /linkedin/profile "query=$1" main=true)" ;; esac
+      rc=$?
+      if [ $rc = 0 ]; then echo "reach: served by harvestapi" >&2; printf '%s' "$out" | jq -c '.element'; exit 0; fi
+      [ $rc = 5 ] && exit 1
+      echo "reach: falling back to Apify" >&2
       case "$1" in
         *"/company/"*) input="$(jq -n --arg u "$1" '{companies:[$u]}')"
                        _apify_items "harvestapi~linkedin-company" "$input" | jq -c '.[]' ;;
@@ -369,6 +482,90 @@ except Exception as exc:
     [ $# -ge 1 ] || { echo "usage: reach facebook <query>" >&2; exit 2; }
     b="$(_ar_backend facebook)"; [ "$b" = none ] && _need_social facebook "agent-reach install --channels facebook"
     opencli facebook search "$*" -f yaml ;;
+
+  tiktok|tt) # reach tiktok <user|url> [limit]   (ScrapeCreators, 1 credit per 10 videos, no cookies)
+    [ $# -ge 1 ] || { echo "usage: reach tiktok <user|url> [limit]" >&2; exit 2; }
+    handle="${1#*tiktok.com/}"; handle="${handle#@}"; handle="${handle%%[/?]*}"
+    lim="${2:-10}"; [[ "$lim" =~ ^[0-9]+$ ]] && [ "$lim" -ge 1 ] && [ "$lim" -le 50 ] || { echo "reach: limit must be 1..50" >&2; exit 2; }
+    maxp="$(_pages)" || exit $?; want=$(( (lim + 9) / 10 )); [ "$want" -gt "$maxp" ] && want="$maxp"
+    pd="$(mktemp -d)"; trap 'rm -rf "$pd"' EXIT
+    cur=""; n=0
+    while [ "$n" -lt "$want" ]; do
+      if [ -n "$cur" ]; then _sc /v3/tiktok/profile/videos "handle=$handle" "max_cursor=$cur" trim=true >"$pd/$n.json" || { rm -f "$pd/$n.json"; break; }
+      else _sc /v3/tiktok/profile/videos "handle=$handle" trim=true >"$pd/$n.json" || { rm -f "$pd/$n.json"; break; }; fi
+      cur="$(jq -r 'if .has_more == true or .has_more == 1 then .max_cursor // empty else empty end' "$pd/$n.json")"
+      n=$((n + 1)); [ -n "$cur" ] || break
+    done
+    [ "$n" -gt 0 ] || exit 1   # no fallback wired: Bright Data's TikTok dataset is async and unverified
+    _sc_total "$n"
+    jq -rs --arg h "$handle" --argjson n "$lim" '
+      ((.[0].aweme_list[0].author // {}) | "## @\(.unique_id // $h) | \(.nickname // "") | followers:\(.follower_count // "?") videos:\(.aweme_count // "?")"),
+      ([.[].aweme_list // [] | .[]] | .[:$n][] | "- video\(if .is_top == 1 or .is_top == true then " (pinned)" else "" end) | \((.create_time // 0) | todate) | plays:\(.statistics.play_count // 0) likes:\(.statistics.digg_count // 0) comments:\(.statistics.comment_count // 0) shares:\(.statistics.share_count // 0)\n  https://www.tiktok.com/@\($h)/video/\(.aweme_id)\n  \((.desc // "") | gsub("\\s+";" ") | .[0:200])")' "$pd"/*.json ;;
+
+  facebook-page|fb-page) # reach facebook-page <page-url|name> [limit]   (ScrapeCreators, 1 credit per ~3 posts, no cookies)
+    [ $# -ge 1 ] || { echo "usage: reach facebook-page <page-url|name> [limit]" >&2; exit 2; }
+    case "$1" in http*) url="$1";; *) url="https://www.facebook.com/$1";; esac
+    lim="${2:-6}"; [[ "$lim" =~ ^[0-9]+$ ]] && [ "$lim" -ge 1 ] && [ "$lim" -le 15 ] || { echo "reach: limit must be 1..15" >&2; exit 2; }
+    maxp="$(_pages)" || exit $?; want=$(( (lim + 2) / 3 )); [ "$want" -gt "$maxp" ] && want="$maxp"
+    pd="$(mktemp -d)"; trap 'rm -rf "$pd"' EXIT
+    cur=""; n=0
+    while [ "$n" -lt "$want" ]; do
+      if [ -n "$cur" ]; then _sc /v1/facebook/profile/posts "url=$url" "cursor=$cur" >"$pd/$n.json" || { rm -f "$pd/$n.json"; break; }
+      else _sc /v1/facebook/profile/posts "url=$url" >"$pd/$n.json" || { rm -f "$pd/$n.json"; break; }; fi
+      cur="$(jq -r '.cursor // empty' "$pd/$n.json")"
+      n=$((n + 1)); [ -n "$cur" ] || break
+    done
+    [ "$n" -gt 0 ] || exit 1
+    _sc_total "$n"
+    # topComments are third-party people: deliberately not printed.
+    jq -rs --argjson n "$lim" '[.[].posts // [] | .[]] | .[:$n][] | "- \(if .videoDetails then "video" else "post" end) | \(if .publishTime then (.publishTime | todate) else "" end) | reactions:\(.reactionCount // 0) comments:\(.commentCount // 0) shares:\(.share_count // 0)\(if .videoViewCount then " views:\(.videoViewCount)" else "" end)\n  \(.url // .permalink // "")\n  \((.text // "") | gsub("\\s+";" ") | .[0:200])"' "$pd"/*.json ;;
+
+  reviews) # reach reviews <google-maps-place-url> [days]   (Bright Data dataset, async, 1 credit per review)
+    # Google Maps reviews are the one thing here no other vendor of ours returns.
+    # Bright Data bills per delivered record (errors included): 5,000 free credits a
+    # month, then $1.50/1k. REACH_BD_MAX caps records (default 20, max 200).
+    [ $# -ge 1 ] || { echo "usage: reach reviews <google-maps-place-url> [days]   |   reach reviews --snapshot <id>" >&2; exit 2; }
+    [ -n "${BRIGHTDATA_API_KEY:-}" ] || { echo "reach: BRIGHTDATA_API_KEY not set in $KEYS" >&2; exit 3; }
+    bd="https://api.brightdata.com/datasets/v3"; ah="Authorization: Bearer $BRIGHTDATA_API_KEY"
+    _bd_print() { jq -r 'if type=="array" then . else [.] end | .[] | if .error then "- (error record, billed) \(.error_code // "") \(.error)" else "- \(.review_rating // "?")★ | \(.review_date // "") | \(.reviewer_name // "")\(if .local_guide then " (local guide)" else "" end)\n  \((.review // "") | gsub("\\s+";" ") | .[0:300])\(if .response_of_owner then "\n  owner: \(.response_of_owner | gsub("\\s+";" ") | .[0:160])" else "" end)" end'; }
+    if [ "$1" = --snapshot ]; then
+      [ $# -eq 2 ] || { echo "usage: reach reviews --snapshot <id>" >&2; exit 2; }
+      curl -sS --max-time 60 -H "$ah" "$bd/snapshot/$2?format=json" | _bd_print; exit 0
+    fi
+    case "$1" in
+      https://www.google.*/maps/*|https://maps.google.*|https://maps.app.goo.gl/*|https://goo.gl/maps/*) url="$1" ;;
+      *) echo "reach: pass a Google Maps place URL (open the place on maps.google.com and copy the address bar)" >&2; exit 2 ;;
+    esac
+    days="${2:-}"; max="${REACH_BD_MAX:-20}"
+    [[ "$max" =~ ^[0-9]+$ ]] && [ "$max" -ge 1 ] && [ "$max" -le 200 ] || { echo "reach: REACH_BD_MAX must be 1..200" >&2; exit 2; }
+    input="$(jq -n --arg u "$url" --arg d "$days" '{input:[{url:$u} + (if $d != "" then {days_limit:($d|tonumber)} else {} end)]}')"
+    tr="$(curl -sS --max-time 30 -X POST -H "$ah" -H "Content-Type: application/json" \
+      "$bd/trigger?dataset_id=gd_luzfs1dn2oa0teb81&include_errors=true&limit_multiple_results=$max" -d "$input" 2>&1)"
+    sid="$(printf '%s' "$tr" | jq -r '.snapshot_id // empty' 2>/dev/null)"
+    if [ -z "$sid" ]; then
+      case "$tr" in
+        *"not active"*) echo "reach: brightdata: account not active yet (activate it at brightdata.com/cp); nothing was billed" >&2 ;;
+        *"Invalid credentials"*|*"Credentials are missing"*) echo "reach: brightdata: key rejected (401)" >&2 ;;
+        *) echo "reach: brightdata: $(printf '%s' "$tr" | head -c 200)" >&2 ;;
+      esac
+      exit 1
+    fi
+    echo "reach: brightdata snapshot $sid (max $max records, billed per record)" >&2
+    # 25 HTTP 429s in 5 minutes blacklist the IP on every Bright Data API, so poll slowly.
+    waited=0; wmax="${REACH_BD_WAIT:-600}"
+    while [ "$waited" -lt "$wmax" ]; do
+      st="$(curl -sS --max-time 20 -H "$ah" "$bd/progress/$sid" | jq -r '.status // "?"' 2>/dev/null)"
+      case "$st" in
+        ready) out="$(curl -sS --max-time 60 -H "$ah" "$bd/snapshot/$sid?format=json")"
+               echo "reach: served by brightdata, $(printf '%s' "$out" | jq 'if type=="array" then length else 1 end') record(s) billed" >&2
+               printf '%s' "$out" | _bd_print; exit 0 ;;
+        failed|canceled) echo "reach: brightdata snapshot $st" >&2; exit 1 ;;
+      esac
+      sleep 10; waited=$((waited + 10))
+    done
+    # Not cancelled on purpose: the collection is paid for, so keep the result.
+    echo "reach: still collecting after ${wmax}s; fetch later with: reach reviews --snapshot $sid" >&2
+    exit 4 ;;
 
   crawl) # reach crawl {map <domain>|site <url>} [flags]   (Firecrawl, USES CREDITS)
     sub="${1:-}"; shift 2>/dev/null || true
@@ -435,12 +632,45 @@ except Exception as exc:
       fi
       if [ -n "$apify_bad" ]; then no apify "$apify_bad"; else ok apify "paid plan, within monthly cap"; fi
     fi
-    if [ -n "${APIFY_TOKEN:-}" ]; then ok instagram "reach instagram <user>  (Apify, no cookies)"; else no instagram "set APIFY_TOKEN in $KEYS"; fi
-    if [ -n "${APIFY_TOKEN:-}" ]; then ok reddit "reach reddit <sub>  (Apify, no app/cookies)"; else no reddit "set APIFY_TOKEN in $KEYS"; fi
-    if [ -n "${APIFY_TOKEN:-}" ]; then
+    # Social-data vendors: balance reads are free calls, so these show live numbers.
+    hv_ok=""; sc_ok=""
+    if [ -n "${HARVESTAPI_KEY:-}" ]; then
+      hb="$(curl -s --max-time 12 -H "X-API-Key: $HARVESTAPI_KEY" https://api.harvestapi.io/users/my-api-user | jq -r '.usage.balance // empty' 2>/dev/null)"
+      if [ -n "$hb" ] && awk "BEGIN{exit !($hb >= 0.01)}"; then ok harvestapi "\$$hb left (LinkedIn, \$0.004 per lookup or ~100-post page)"; hv_ok=1
+      elif [ -n "$hb" ]; then no harvestapi "\$$hb left, top up at harvestapi.io"
+      else no harvestapi "key rejected or API unreachable"; fi
+    else no harvestapi "optional: set HARVESTAPI_KEY in $KEYS (LinkedIn, cheaper than Apify)"; fi
+    if [ -n "${SCRAPECREATORS_API_KEY:-}" ]; then
+      sb="$(curl -s --max-time 12 -H "x-api-key: $SCRAPECREATORS_API_KEY" https://api.scrapecreators.com/v1/credit-balance | jq -r '.creditCount // empty' 2>/dev/null)"
+      if [ -n "$sb" ] && [ "$sb" -ge 10 ] 2>/dev/null; then ok scrapecreators "$sb credits left (IG/TikTok/FB, 1 credit per page)"; sc_ok=1
+      elif [ -n "$sb" ]; then no scrapecreators "$sb credits left, top up at scrapecreators.com"
+      else no scrapecreators "key rejected or API unreachable"; fi
+    else no scrapecreators "optional: set SCRAPECREATORS_API_KEY in $KEYS (IG/TikTok/FB)"; fi
+    if [ -n "${BRIGHTDATA_API_KEY:-}" ]; then
+      # No balance read with a scraper key (403). A trigger with a deliberately invalid
+      # input is rejected before anything runs, so it is free and still says whether
+      # the key works and the account is active.
+      bp="$(curl -s --max-time 15 -X POST -H "Authorization: Bearer $BRIGHTDATA_API_KEY" -H "Content-Type: application/json" \
+        "https://api.brightdata.com/datasets/v3/trigger?dataset_id=gd_luzfs1dn2oa0teb81" -d '{"input":[{}]}' 2>/dev/null)"
+      case "$bp" in
+        *validation_error*) ok brightdata "key works, account active (balance not readable with this key)" ;;
+        *"not active"*) no brightdata "account not active yet: activate at brightdata.com/cp" ;;
+        *) no brightdata "$(printf '%s' "$bp" | head -c 70)" ;;
+      esac
+    else no brightdata "optional: set BRIGHTDATA_API_KEY in $KEYS (reach reviews)"; fi
+    if [ -n "$sc_ok" ]; then ok instagram "reach instagram <user>  (ScrapeCreators, Apify fallback)"
+    elif [ -n "${APIFY_TOKEN:-}" ] && [ -z "$apify_bad" ]; then ok instagram "reach instagram <user>  (Apify only)"
+    else no instagram "needs SCRAPECREATORS_API_KEY or a working APIFY_TOKEN"; fi
+    if [ -n "$sc_ok" ]; then ok tiktok "reach tiktok <user>  (ScrapeCreators)"; ok facebook-page "reach facebook-page <page>  (ScrapeCreators)"
+    else no tiktok "needs SCRAPECREATORS_API_KEY"; no facebook-page "needs SCRAPECREATORS_API_KEY"; fi
+    if [ -n "${APIFY_TOKEN:-}" ] && [ -n "$apify_bad" ]; then
+      for r in reddit x-public x-followers; do no "$r" "Apify refuses runs (see the apify line)"; done
+    elif [ -n "${APIFY_TOKEN:-}" ]; then
+      ok reddit "reach reddit <sub>  (Apify, no app/cookies)"
       ok x-public "reach x-public <query>  (Apify Actor, public data)"
       ok x-followers "reach x-followers <handle>  (Apify Actor, public data)"
     else
+      no reddit "set APIFY_TOKEN in $KEYS"
       no x-public "set APIFY_TOKEN in $KEYS"
       no x-followers "set APIFY_TOKEN in $KEYS"
     fi
@@ -449,7 +679,9 @@ except Exception as exc:
     if [ -n "$ws_ok" ]; then ok transcribe "reach transcribe <audio>  (whisper.cpp at $ws_ok, Groq fallback)"
     elif [ -n "${GROQ_API_KEY:-}" ]; then ok transcribe "reach transcribe <audio>  (Groq Whisper)"
     else no transcribe "set WHISPER_SERVER_URL or GROQ_API_KEY in $KEYS"; fi
-    if [ -n "${APIFY_TOKEN:-}" ]; then ok linkedin "reach linkedin <url>  (Apify, no cookies)"; else no linkedin "set APIFY_TOKEN in $KEYS"; fi
+    if [ -n "$hv_ok" ]; then ok linkedin "reach linkedin <url>  (HarvestAPI, Apify fallback)"
+    elif [ -n "${APIFY_TOKEN:-}" ] && [ -z "$apify_bad" ]; then ok linkedin "reach linkedin <url>  (Apify only)"
+    else no linkedin "needs HARVESTAPI_KEY or a working APIFY_TOKEN"; fi
     for p in twitter facebook; do
       b="$(_ar_backend "$p")"
       if [ "$b" != none ]; then ok "$p" "reach $p  (via agent-reach: $b)"
@@ -467,7 +699,10 @@ reach | server-less internet fetch (direct APIs + CLIs, no MCP, no RAM)
   reach yt <url>             YouTube metadata + auto transcript (yt-dlp)
   reach rss <feed-url>       latest items from an RSS/Atom feed
   reach repo <org/repo>      GitHub metadata + README (gh)
-  reach instagram <user>     Instagram posts (Apify actor, needs APIFY_TOKEN)
+  reach instagram <user> [n] Instagram posts (ScrapeCreators, Apify fallback)
+  reach tiktok <user> [n]    TikTok videos (ScrapeCreators)
+  reach facebook-page <page> [n] Facebook page posts (ScrapeCreators)
+  reach reviews <maps-url> [days] Google Maps reviews (Bright Data, async)
   reach reddit <query>       Reddit search (Apify, no app); scope with: reach reddit r/<sub> <query>
   reach x-public <query>     Public X search   (Apify Actor, no cookies)
   reach x-public user <handle> Public X timeline (Apify Actor, no cookies)
@@ -475,17 +710,20 @@ reach | server-less internet fetch (direct APIs + CLIs, no MCP, no RAM)
   reach doc <file>           Word/PPT/Excel/PDF/EPUB/ODF -> markdown (local, keyless)
   reach transcribe <audio>   audio/podcast -> text (whisper.cpp at WHISPER_SERVER_URL, Groq fallback)
   reach x <query>            X/Twitter    (routes to agent-reach, needs burner setup)
-  reach linkedin <url>       LinkedIn profile/company (Apify, no cookies)
-  reach linkedin posts <url> LinkedIn post history (Apify, no cookies)
+  reach linkedin <url>       LinkedIn profile/company (HarvestAPI, Apify fallback)
+  reach linkedin posts <url> LinkedIn post history (HarvestAPI, Apify fallback)
   reach facebook <query>     Facebook     (routes to agent-reach, needs burner setup)
   reach crawl map <domain>   discover URLs (Firecrawl, uses credits)
   reach crawl site <url>     managed JS crawl (Firecrawl, uses credits)
-  reach doctor               what works right now
+  reach doctor               what works right now, with live vendor balances
 
 reach is the single front door: each command auto-picks its backend; the cookie-gated
 platforms (x for logged-in depth, facebook) route to agent-reach under the hood.
 Keys: ~/.reach/keys.env  ->  EXA_API_KEY, JINA_API_KEY, FIRECRAWL_API_KEY, APIFY_TOKEN
-      (IG+Reddit+X+LinkedIn Actors), GROQ_API_KEY, PERPLEXITY_API_KEY
+      (Reddit+X Actors, IG+LinkedIn fallback), HARVESTAPI_KEY, SCRAPECREATORS_API_KEY,
+      BRIGHTDATA_API_KEY, GROQ_API_KEY, PERPLEXITY_API_KEY
+Paid social calls print their cost on stderr. REACH_PAGES=1..5 (default 1) bounds
+billed pages per call; REACH_BD_MAX=1..200 (default 20) bounds Bright Data records.
 Self-hosted (optional, comma-separate several): SEARXNG_URL, WHISPER_SERVER_URL
 Set REACH_APIFY_LIMIT=1..200 to change the X Actor result cap. The default is 20.
 EOF
