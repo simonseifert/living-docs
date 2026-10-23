@@ -3,10 +3,10 @@ name: reach
 description: >-
   Server-less internet fetch for agents | read any web page (JS-rendered),
   search the web, pull YouTube transcripts, RSS feeds, GitHub repos/READMEs,
-  DeepWiki repo explainers, and managed JS crawls. One CLI (`reach`) that
-  shells out to direct HTTP APIs + already-installed tools (Jina Reader, Exa,
-  yt-dlp, gh, Firecrawl), with NO MCP servers and NO background daemons (zero
-  RAM footprint). Use when you need to fetch or search public internet content
+  DeepWiki repo explainers, managed JS crawls, local document-to-markdown
+  (PDF/Word/Excel/PPT) and audio/podcast transcription. One CLI (`reach`) over
+  direct HTTP APIs + installed tools (Jina Reader, Exa, yt-dlp, gh, Firecrawl),
+  NO MCP servers, NO daemons. Use to fetch or search public internet content
   from the command line. Also does account-safe social with no cookies:
   LinkedIn profiles/companies/posts (HarvestAPI), Instagram, TikTok and Facebook
   page posts (ScrapeCreators), Google Maps reviews (Bright Data), Reddit and
@@ -90,15 +90,14 @@ billed pages per call; `REACH_BD_MAX` caps Bright Data records (default 20).
 - **Direct API / CLI over MCP servers.** Local MCP servers cost RAM; remote MCP servers cost always-loaded context. A stateless curl/CLI call costs neither. Only reach for an MCP when a source has no usable direct endpoint (e.g. grep.app blocks direct calls; use its remote MCP if you need it).
 - **Keyless by default.** web / repo-wiki / yt / rss / repo / crawl need no key of ours. `search` uses Exa if keyed, else a self-hosted SearXNG (`SEARXNG_URL`), else keyless Jina. Optional `JINA_API_KEY` raises the web-read rate limit. Keys live in `~/.reach/keys.env` (gitignored, chmod 600), never in a brief, node, or repo.
 - **Local files stay local.** `reach doc` converts Word/PowerPoint/Excel/PDF/EPUB/ODF on this machine via anydoc (pure Rust, no ML, no service, no key, median <5ms). Firecrawl's hosted /parse does the same conversion, but these are usually a client's contract or RFP — do not send one to a third party to read it. The one exception is a scanned/image-only PDF, which needs OCR; anydoc says so explicitly and the error names the hosted fallback.
-- **Cost ladder for reading pages:** `reach web` (free Jina) for single pages incl. JS → `reach crawl` (Firecrawl, credits) ONLY when you need URL discovery with no sitemap, or SPA click/scroll interaction. Do not `crawl` a large predictable-URL KB (`reach web` per URL is free for that).
-- **One front door, explicit X routes.** `reach instagram`, `reach reddit`, `reach x-public`, and `reach x-followers` run through Apify Actors directly. `reach x` remains the deeper cookie-backed route through `agent-reach`; adding Actor routes does not replace it. Use `reach x-public` for public posts and `reach x-followers` for public audience relations without a browser account.
+- **Cost ladder for reading pages:** `reach web` (free Jina, then free local Chromium; Firecrawl only as a 1-credit last resort) for single pages incl. JS → `reach crawl` (Firecrawl, credits) ONLY when you need URL discovery with no sitemap, or SPA click/scroll interaction. Do not `crawl` a large predictable-URL KB (`reach web` per URL is free for that).
+- **One front door, explicit X routes.** `reach reddit`, `reach x-public` and `reach x-followers` run through Apify Actors directly; `reach x` stays the deeper cookie-backed route via `agent-reach` (details below).
 
 ## Public X without a browser account
 
 `reach x-public` (search and timelines) and `reach x-followers` (audience
 relations) run through Apify Actors: a keyed API call, no cookies, no account
-risk. `reach x` remains the deeper cookie-backed route via agent-reach; these
-do not replace it.
+risk. They do not replace `reach x`.
 
 ```bash
 reach x-public '"web scraping" lang:en'
