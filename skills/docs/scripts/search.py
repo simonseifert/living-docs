@@ -194,9 +194,10 @@ def build_query(q, raw):
     return " ".join('"' + w.replace('"', '""') + '"' for w in words)
 
 
-def search(con, q, tool=None, limit=8, briefs_only=False, raw=False):
+def search(con, q, tool=None, limit=8, briefs_only=False, raw=False, full=False):
     sql = ("SELECT c.tool, c.path, c.line, c.heading, c.brief, "
            "snippet(fts, 1, '[', ']', ' ... ', 32) AS snip, "
+           + ("fts.text AS body, " if full else "") +
            "bm25(fts, 3.0, 1.0) * CASE c.brief WHEN 1 THEN ? ELSE 1.0 END AS score "
            "FROM fts JOIN chunks c ON c.id = fts.rowid WHERE fts MATCH ?")
     args = [BRIEF_BOOST, build_query(q, raw)]
@@ -207,7 +208,7 @@ def search(con, q, tool=None, limit=8, briefs_only=False, raw=False):
         sql += " AND c.brief = 1"
     sql += " ORDER BY score LIMIT ?"
     args.append(limit)
-    cols = ["tool", "path", "line", "heading", "brief", "snippet", "score"]
+    cols = ["tool", "path", "line", "heading", "brief", "snippet"] + (["text"] if full else []) + ["score"]
     return [dict(zip(cols, r)) for r in con.execute(sql, args)]
 
 
@@ -218,6 +219,7 @@ def main():
     ap.add_argument("--limit", type=int, default=8)
     ap.add_argument("--briefs-only", action="store_true")
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--full", action="store_true", help="with --json: include each hit's whole chunk text")
     ap.add_argument("--raw", action="store_true", help="raw FTS5 query syntax")
     ap.add_argument("--reindex", action="store_true", help="rebuild the index")
     a = ap.parse_args()
@@ -234,7 +236,7 @@ def main():
         if not a.query:
             return
     try:
-        hits = search(con, a.query, a.tool, a.limit, a.briefs_only, a.raw)
+        hits = search(con, a.query, a.tool, a.limit, a.briefs_only, a.raw, a.full)
     except sqlite3.OperationalError as e:
         sys.exit(f"query error: {e} (try without --raw)")
     if a.json:
