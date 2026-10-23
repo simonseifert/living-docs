@@ -520,14 +520,27 @@ except Exception as exc:
     # topComments are third-party people: deliberately not printed.
     jq -rs --argjson n "$lim" '[.[].posts // [] | .[]] | .[:$n][] | "- \(if .videoDetails then "video" else "post" end) | \(if .publishTime then (.publishTime | todate) else "" end) | reactions:\(.reactionCount // 0) comments:\(.commentCount // 0) shares:\(.share_count // 0)\(if .videoViewCount then " views:\(.videoViewCount)" else "" end)\n  \(.url // .permalink // "")\n  \((.text // "") | gsub("\\s+";" ") | .[0:200])"' "$pd"/*.json ;;
 
-  reviews) # reach reviews <google-maps-place-url> [days]   (Bright Data dataset, async, 1 credit per review)
+  reviews) # reach reviews <google-maps-place-url> [days]   (Bright Data dataset, async, 1 credit per record; UNSUPPORTED, see below)
     # Google Maps reviews are the one thing here no other vendor of ours returns.
     # Bright Data bills per delivered record (errors included): 5,000 free credits a
     # month, then $1.50/1k. REACH_BD_MAX caps records (default 20, max 200).
     [ $# -ge 1 ] || { echo "usage: reach reviews <google-maps-place-url> [days]   |   reach reviews --snapshot <id>" >&2; exit 2; }
     [ -n "${BRIGHTDATA_API_KEY:-}" ] || { echo "reach: BRIGHTDATA_API_KEY not set in $KEYS" >&2; exit 3; }
+    # UNSUPPORTED (2026-10-23). Two live runs, two billed error records, zero reviews:
+    # an Eiffel Tower URL without a place id -> "Sign in modal hides the Reviews", and
+    # a canonical Empire State Building place URL (data=...!1s0x..:0x..) -> timeout
+    # waiting for the sort menu ([role=menu] [role=menuitemradio]). Both are Google
+    # showing signed-out visitors its limited view, which Bright Data's scraper does
+    # not get past. So it refuses by default instead of billing for an error record;
+    # REACH_BD_REVIEWS=1 runs it anyway, to re-test.
+    if [ "$1" != --snapshot ] && [ "${REACH_BD_REVIEWS:-}" != 1 ]; then
+      echo "reach: reviews unsupported: Bright Data's Google Maps reviews scraper returned 0 reviews and a billed error record on every test (2026-10-23, Google's signed-out limited view). Set REACH_BD_REVIEWS=1 to try anyway." >&2
+      exit 5
+    fi
     bd="https://api.brightdata.com/datasets/v3"; ah="Authorization: Bearer $BRIGHTDATA_API_KEY"
-    _bd_print() { jq -r 'if type=="array" then . else [.] end | .[] | if .error then "- (error record, billed) \(.error_code // "") \(.error)" else "- \(.review_rating // "?")★ | \(.review_date // "") | \(.reviewer_name // "")\(if .local_guide then " (local guide)" else "" end)\n  \((.review // "") | gsub("\\s+";" ") | .[0:300])\(if .response_of_owner then "\n  owner: \(.response_of_owner | gsub("\\s+";" ") | .[0:160])" else "" end)" end'; }
+    # Field names: the dataset's schema says review_rating/review, the API reference
+    # example says rating/review_text; accept both.
+    _bd_print() { jq -r 'if type=="array" then . else [.] end | .[] | if .error then "- (error record, billed) \(.error_code // "") \(.error)" else "- \(.review_rating // .rating // "?")★ | \(.review_date // "") | \(.reviewer_name // "")\(if .local_guide then " (local guide)" else "" end)\n  \((.review // .review_text // "") | gsub("\\s+";" ") | .[0:300])\(if .response_of_owner then "\n  owner: \(.response_of_owner | gsub("\\s+";" ") | .[0:160])" else "" end)" end'; }
     if [ "$1" = --snapshot ]; then
       [ $# -eq 2 ] || { echo "usage: reach reviews --snapshot <id>" >&2; exit 2; }
       curl -sS --max-time 60 -H "$ah" "$bd/snapshot/$2?format=json" | _bd_print; exit 0
@@ -558,7 +571,14 @@ except Exception as exc:
       case "$st" in
         ready) out="$(curl -sS --max-time 60 -H "$ah" "$bd/snapshot/$sid?format=json")"
                echo "reach: served by brightdata, $(printf '%s' "$out" | jq 'if type=="array" then length else 1 end') record(s) billed" >&2
-               printf '%s' "$out" | _bd_print; exit 0 ;;
+               printf '%s' "$out" | _bd_print
+               # Only error records means no reviews at all: say so and fail, rather
+               # than exit 0 with nothing a caller would read as "no reviews exist".
+               nrev="$(printf '%s' "$out" | jq '[if type=="array" then .[] else . end | select(.error | not)] | length' 2>/dev/null)"
+               if [ "${nrev:-0}" -eq 0 ]; then
+                 echo "reach: 0 reviews returned (Bright Data reviews scraper is unsupported, see above)" >&2; exit 1
+               fi
+               exit 0 ;;
         failed|canceled) echo "reach: brightdata snapshot $st" >&2; exit 1 ;;
       esac
       sleep 10; waited=$((waited + 10))
@@ -702,7 +722,7 @@ reach | server-less internet fetch (direct APIs + CLIs, no MCP, no RAM)
   reach instagram <user> [n] Instagram posts (ScrapeCreators, Apify fallback)
   reach tiktok <user> [n]    TikTok videos (ScrapeCreators)
   reach facebook-page <page> [n] Facebook page posts (ScrapeCreators)
-  reach reviews <maps-url> [days] Google Maps reviews (Bright Data, async)
+  reach reviews <maps-url> [days] Google Maps reviews: UNSUPPORTED (Bright Data returns 0, 2026-10-23)
   reach reddit <query>       Reddit search (Apify, no app); scope with: reach reddit r/<sub> <query>
   reach x-public <query>     Public X search   (Apify Actor, no cookies)
   reach x-public user <handle> Public X timeline (Apify Actor, no cookies)

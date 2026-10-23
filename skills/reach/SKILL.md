@@ -9,7 +9,7 @@ description: >-
   NO MCP servers, NO daemons. Use to fetch or search public internet content
   from the command line. Also does account-safe social with no cookies:
   LinkedIn profiles/companies/posts (HarvestAPI), Instagram, TikTok and Facebook
-  page posts (ScrapeCreators), Google Maps reviews (Bright Data), Reddit and
+  page posts (ScrapeCreators), Google Maps reviews (Bright Data, currently unsupported), Reddit and
   public X (Apify Actors), each printing which vendor answered and what it cost.
   Is the single front door for fetching; cookie-gated deep social (Facebook
   search, and X with a session) routes to `agent-reach` under the hood (needs a
@@ -37,7 +37,7 @@ reach repo <org/repo>       GitHub metadata + README (gh)                       
 reach instagram <user> [n]  Instagram posts: ScrapeCreators -> Apify                   [SCRAPECREATORS_API_KEY / APIFY_TOKEN]
 reach tiktok <user> [n]     TikTok videos with plays/likes/shares (ScrapeCreators)     [SCRAPECREATORS_API_KEY]
 reach facebook-page <page> [n] Facebook PAGE posts (ScrapeCreators, no cookies)        [SCRAPECREATORS_API_KEY]
-reach reviews <maps-url> [days] Google Maps reviews (Bright Data, async, slow)         [BRIGHTDATA_API_KEY]
+reach reviews <maps-url> [days] Google Maps reviews: UNSUPPORTED, refuses unless REACH_BD_REVIEWS=1 [BRIGHTDATA_API_KEY]
 reach reddit <query>        Reddit search (scope with r/<sub> <query>), no cookies       [uses APIFY_TOKEN]
 reach x-public <query>      Public X search (Apify Actor, no cookies)                 [uses APIFY_TOKEN]
 reach x-public user <handle> Public X timeline (Apify Actor, no cookies)                [uses APIFY_TOKEN]
@@ -71,7 +71,7 @@ reach doctor                what works right now, with each vendor's live balanc
 | TikTok videos | ScrapeCreators, 1 credit per 10 | none | `reach tiktok`, `intel content` |
 | Facebook page posts | ScrapeCreators, 1 credit per 3 | none | `reach facebook-page`, `intel content` |
 | YouTube | yt-dlp, free | | `reach yt`, `intel content` (Shorts) |
-| Google Maps reviews | Bright Data, 1 credit per record (5k free/month), ~10 min | none | `reach reviews` (first live run returned an error record: treat as experimental) |
+| Google Maps reviews | **unsupported**: Bright Data returned 0 reviews and 1 billed error record on both live runs (2026-10-22/23: "Sign in modal hides the Reviews", then a timeout on the sort menu; Google's signed-out limited view) | none | `reach reviews` refuses (exit 5) unless `REACH_BD_REVIEWS=1`; exits 1 when a run returns only error records |
 | Reddit, public X | Apify actors | | `reach reddit`, `reach x-public` |
 
 **Balances:** `reach doctor` shows HarvestAPI dollars, ScrapeCreators credits, the Apify
