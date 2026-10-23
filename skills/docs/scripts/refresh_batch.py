@@ -364,7 +364,66 @@ def pending_since_move(stale, tool, state):
             if s["stale"] or not s["last_fetched"] or s["last_fetched"] < since]
 
 
-def select(stale, detect, tools, explicit, max_n, all_tools=False):
+# Major-version feed: an outside watcher (e.g. a nightly version checker) appends one JSON line per
+# new MAJOR release of a tool that has a brief: {"tool", "new_version",
+# "old_major", "source", ...}. Unseen (tool, new_version) pairs put every section
+# of that tool first in the next run and leave a review note, because a major
+# release needs a real rewrite that number-only patches cannot make.
+MAJOR_FEED = Path(os.path.expanduser(os.environ.get(
+    "DOCS_MAJOR_FEED", "~/docs-reference/_inbox/majors.jsonl")))
+MAJOR_SEEN = LIB / "_state" / "major-bumps.json"
+
+
+def major_bumps(tools):
+    """Unseen major releases for tools in `tools`, oldest first, one per (tool, version)."""
+    try:
+        lines = MAJOR_FEED.read_text().splitlines()
+    except OSError:
+        return []
+    try:
+        seen = set(json.loads(MAJOR_SEEN.read_text()))
+    except (OSError, ValueError):
+        seen = set()
+    out, keys = [], set()
+    for line in lines:
+        try:
+            b = json.loads(line)
+            key = f"{b['tool']}@{b['new_version']}"
+        except (ValueError, KeyError, TypeError):
+            continue
+        if b["tool"] in tools and key not in seen and key not in keys and (LIB / b["tool"] / "brief.md").exists():
+            keys.add(key)
+            out.append(b)
+    return out
+
+
+def mark_major_seen(bumps):
+    try:
+        seen = set(json.loads(MAJOR_SEEN.read_text()))
+    except (OSError, ValueError):
+        seen = set()
+    seen |= {f"{b['tool']}@{b['new_version']}" for b in bumps}
+    MAJOR_SEEN.parent.mkdir(parents=True, exist_ok=True)
+    MAJOR_SEEN.write_text(json.dumps(sorted(seen), indent=1) + "\n")
+
+
+def queue_major(b, dry):
+    if dry:
+        return
+    REVIEW_DIR.mkdir(exist_ok=True)
+    runs = ", ".join(f"{k} on {v}" for k, v in (b.get("we_run") or {}).items()) or "unknown"
+    (REVIEW_DIR / f"{b['tool']}--major-{b['new_version']}.md").write_text(
+        f"# New major version: {b['tool']} {b['new_version']}\n\n"
+        f"- date: {_today()}\n- seen by: {b.get('source', '?')} at {b.get('at', '?')}\n"
+        f"- previous major: {b.get('old_major', '?')}\n- our projects run: {runs}\n\n"
+        "The nightly job re-checked this tool's sections first, but it only makes number-level "
+        "edits. Read the release notes and migration guide, then run `/docs refresh "
+        f"{b['tool']} --all`: rewrite what changed (breaking changes, removed or renamed APIs, "
+        "new defaults, upgrade steps) and add a gotcha if our projects still run the old major. "
+        "Delete this file when done.\n")
+
+
+def select(stale, detect, tools, explicit, max_n, all_tools=False, first=()):
     results = detect.detect_all(tools)
     moved = [t for t in tools if results.get(t, {}).get("status") == "moved"]
     recent = set(tools) if (explicit or all_tools) else recent_tools(tools)
@@ -378,13 +437,22 @@ def select(stale, detect, tools, explicit, max_n, all_tools=False):
     # a backlog of moved tools cannot starve the stale sections of the rest.
     state = detect.load_state()
     queues = []
+    cap = max(1, max_n // 2)
+    # Major releases go before everything, inside the same half-run cap.
+    for t in first:
+        for s in sorted(tool_sections(stale, t), key=lambda s: -s["overdue"]):
+            if len(picked) < cap:
+                picked.append(s)
+                seen.add((s["tool"], s["name"]))
     for t in moved:
+        if t in first:
+            continue
         pending = pending_since_move(stale, t, state)
         if not pending:
             detect.accept(t)
             continue
-        queues.append(sorted(pending, key=lambda s: -s["overdue"]))
-    cap = max(1, max_n // 2)
+        queues.append(sorted([s for s in pending if (s["tool"], s["name"]) not in seen],
+                             key=lambda s: -s["overdue"]))
     while queues and len(picked) < cap:
         for q in list(queues):
             if not q:
@@ -1124,7 +1192,14 @@ def main(argv):
     stale, detect = _load("stale"), _load("detect")
     tools = a.tool or sorted(p.name for p in LIB.iterdir()
                              if p.is_dir() and not p.name.startswith((".", "_")))
-    picked, moved, elig = select(stale, detect, tools, bool(a.tool), a.max, a.all_tools)
+    bumps = major_bumps(tools)
+    first = list(dict.fromkeys(b["tool"] for b in bumps))
+    picked, moved, elig = select(stale, detect, tools, bool(a.tool), a.max, a.all_tools, first)
+    for b in bumps:
+        print(f"major release: {b['tool']} {b['new_version']} ({b.get('source', '?')}), its sections go first")
+        queue_major(b, a.dry_run)
+    if bumps and not a.dry_run:
+        mark_major_seen(bumps)
     print(f"moved tools: {', '.join(moved) or 'none'}; {len(picked)} section(s) selected")
 
     results, stopped = [], None
@@ -1179,6 +1254,7 @@ def main(argv):
     if not a.dry_run:
         log = {"date": _today(), "checked": checked, "changed": changed,
                "selected": len(picked), "moved_tools": moved, "stopped": stopped,
+               "major_releases": [f"{b['tool']} {b['new_version']}" for b in bumps],
                "heading_paths": HEADING_PATHS,
                "leftover_versions": {t: {"old": o, "lines": h} for t, (o, h) in leftovers.items()},
                "results": results}
@@ -1188,6 +1264,9 @@ def main(argv):
 
     body = "\n".join(f"{r['tool']}/{r['section']}: {r['outcome']} {r['summary']}".rstrip()
                      for r in results) or "nothing selected"
+    for b in bumps:
+        body = (f"NEW MAJOR: {b['tool']} {b['new_version']}, brief needs a rewrite "
+                f"(_review/{b['tool']}--major-{b['new_version']}.md)\n") + body
     queued = sum(1 for r in results if r["outcome"] == "queued")
     if queued:
         body += f"\n{queued} proposed patch(es) waiting in _review/: run /docs review"
@@ -1201,7 +1280,7 @@ def main(argv):
         if ev:
             body += "\n" + ev
     print(f"checked {checked}, changed {changed}" + (" (dry run)" if a.dry_run else ""))
-    if results and not a.no_ntfy and not a.dry_run:
+    if (results or bumps) and not a.no_ntfy and not a.dry_run:
         notify(f"docs: auto-refresh {checked} checked, {changed} changed", body)
     return 0
 
