@@ -56,11 +56,16 @@ LIB = Path(os.environ.get(
     Path.home() / "docs-reference",
 ))
 OLLAMA = os.environ.get("OLLAMA_HOST_URL", "http://127.0.0.1:11434")
-MODEL = "gpt-oss:20b"
-# Ollama's default num_ctx (4096) silently truncates big sources and yields empty
-# replies, so run a derived tag of the same weights with a 32k context.
-CTX_MODEL = "gpt-oss-docs:20b"
-CTX_SIZE = 32768
+# If one model stays resident on the GPU for every tool, set DOCS_SHARED_MODEL to
+# it: runs then use it as is (no swap, nothing to wait for or unload). Otherwise
+# the default is gpt-oss-docs:20b (32k ctx). DOCS_LOCAL_MODEL overrides both.
+SHARED_MODEL = os.environ.get("DOCS_SHARED_MODEL", "")
+CTX_MODEL = os.environ.get("DOCS_LOCAL_MODEL", SHARED_MODEL or "gpt-oss-docs:20b")
+MODEL = CTX_MODEL
+NUM_CTX = int(os.environ.get("DOCS_NUM_CTX", "16384"))
+# The fallback runs a derived tag of gpt-oss:20b with a 32k context (Ollama's
+# default context silently truncates big sources).
+FALLBACK_BASE, CTX_SIZE = "gpt-oss:20b", 32768
 SKIP_METHODS = {"last30days", "websearch", "search", "mcp", "context7", "none"}
 IGNORE_TOKENS = {"docs", "api", "page"}
 WALL_MARKERS = ("just a moment", "access denied", "captcha", "enable javascript")
@@ -408,13 +413,26 @@ def url_ok(url):
     return u.scheme.lower() in ALLOWED_SCHEMES and bool(u.netloc)
 
 
+def is_registry(url):
+    """Registry JSON endpoints. They must be fetched raw: a reader service wraps the
+    JSON in a markdown header, json.loads fails and the deterministic registry path
+    silently never runs (it did not, 2026-10-22/23; those went to the model)."""
+    u = url.lower()
+    return ("registry.npmjs.org" in u or ("pypi.org/pypi/" in u and u.rstrip("/").endswith("/json"))
+            or "api.wordpress.org/plugins/info" in u or "api.wordpress.org/themes/info" in u)
+
+
 def fetch_text(url):
     if not url_ok(url):
         raise ValueError("bad url scheme")
     direct = (url.lower().split("?")[0].endswith((".md", ".txt", ".json", ".xml"))
-              or "raw.githubusercontent" in url or "api.github.com" in url)
+              or "raw.githubusercontent" in url or "api.github.com" in url or is_registry(url))
     if direct:
-        req = urllib.request.Request(url, headers={"User-Agent": "docs-refresh/1.0"})
+        headers = {"User-Agent": "docs-refresh/1.0"}
+        if "registry.npmjs.org" in url.lower():
+            # abbreviated metadata: has dist-tags, a fraction of the full document's size
+            headers["Accept"] = "application/vnd.npm.install-v1+json"
+        req = urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(req, timeout=30) as r:
             return r.read().decode("utf-8", errors="replace")
     out = subprocess.run(["reach", "web", url], capture_output=True, text=True, timeout=120)
@@ -514,8 +532,9 @@ def ask_heading(sec, heads):
         + f"\nHEADINGS:\n{listing}\n\n"
         'Respond with ONLY JSON: {"index": <int or null>}.')
     r = ollama_json("/api/chat", {
-        "model": CTX_MODEL, "stream": False, "format": "json", "think": "low",
-        "options": {"temperature": 0, "num_ctx": 8192},
+        "model": CTX_MODEL, "stream": False, "format": "json",
+        "think": "low" if CTX_MODEL.startswith("gpt-oss") else False,
+        "options": {"temperature": 0, "num_ctx": CTX_SIZE if CTX_MODEL.startswith("gpt-oss") else NUM_CTX},
         "messages": [{"role": "user", "content": prompt}]}, timeout=300)
     idx = json.loads(r["message"]["content"]).get("index")
     if idx is None:
@@ -677,10 +696,15 @@ def gpu_busy():
     return False
 
 
+def shared():
+    """True when using the GPU's shared resident model: nothing to wait for or unload."""
+    return CTX_MODEL == SHARED_MODEL
+
+
 def wait_for_gpu():
     """True when clear to proceed, False after ~10 minutes of the GPU staying busy."""
     for _ in range(11):
-        if not gpu_busy():
+        if shared() or not gpu_busy():
             return True
         time.sleep(60)
     return False
@@ -691,10 +715,10 @@ def ensure_ctx_model():
         have = [m["name"] for m in ollama_json("/api/tags").get("models", [])]
     except Exception:
         return
-    if CTX_MODEL in have:
+    if shared() or CTX_MODEL in have or not CTX_MODEL.startswith("gpt-oss-docs"):
         return
     mf = Path(tempfile.mkdtemp()) / "Modelfile"
-    mf.write_text(f"FROM {MODEL}\nPARAMETER num_ctx {CTX_SIZE}\n")
+    mf.write_text(f"FROM {FALLBACK_BASE}\nPARAMETER num_ctx {CTX_SIZE}\n")
     subprocess.run(["ollama", "create", CTX_MODEL, "-f", str(mf)], capture_output=True, timeout=300)
 
 
@@ -748,8 +772,12 @@ def call_model(tool, name, old, fetched):
 
 
 def unload_model():
+    """Free the GPU after a fallback-model run. Never unload the shared model: the
+    other tools on this GPU would all pay a cold reload."""
+    if shared():
+        return
     try:
-        for m in (CTX_MODEL, MODEL):
+        for m in (CTX_MODEL,):
             ollama_json("/api/generate", {"model": m, "keep_alive": 0})
     except Exception:
         pass
@@ -790,7 +818,7 @@ def registry_value(url, fetched):
             return str(j.get("version") or j["dist-tags"]["latest"])
         if "api.github.com" in u and u.rstrip("/").endswith("/releases/latest"):
             return None if j.get("prerelease") else str(j["tag_name"])
-        if "api.wordpress.org/plugins/info" in u:
+        if "api.wordpress.org/plugins/info" in u or "api.wordpress.org/themes/info" in u:
             return str(j["version"])
     except Exception:
         return None

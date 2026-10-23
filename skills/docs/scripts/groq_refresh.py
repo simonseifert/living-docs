@@ -17,8 +17,9 @@ Provider (OpenAI-compatible, pick with --provider):
                          private client context, so they stay off the cloud when possible)
     groq                 openai/gpt-oss-120b @ api.groq.com  (fast, free-tier, key=GROQ_API_KEY)
     deepseek             deepseek-chat @ api.deepseek.com     (stronger, bigger inputs, key=DEEPSEEK_API_KEY)
-    local                gpt-oss-docs:20b (32k ctx) if ollama lists it, else gpt-oss:20b, on a
-                         local Ollama (free, no key, no request-size cap;
+    local                $DOCS_LOCAL_MODEL, else gpt-oss-docs:20b if ollama lists it, else
+                         gpt-oss:20b (non-gpt-oss models run with num_ctx
+                         $DOCS_NUM_CTX=16384 and thinking off), on a local Ollama (free, no key;
                          base from $OLLAMA_URL, default http://127.0.0.1:11434/v1)
     --model / --base override either. Keys are read from env or ~/.reach/keys.env.
 
@@ -82,7 +83,9 @@ SYSTEM = (
 )
 
 
-LOCAL_PREFERRED = "gpt-oss-docs:20b"
+LOCAL_PREFERRED = os.environ.get("DOCS_LOCAL_MODEL", "gpt-oss-docs:20b")
+LOCAL_FALLBACKS = ("gpt-oss-docs:20b",)
+NUM_CTX = int(os.environ.get("DOCS_NUM_CTX", "16384"))
 
 
 def ollama_base():
@@ -100,11 +103,13 @@ def ollama_up():
 
 
 def local_model():
-    """gpt-oss-docs:20b (32k context) if ollama lists it, else the stock tag."""
+    """The preferred model if ollama lists it, else a fallback, else the stock tag."""
     try:
         out = subprocess.run(["ollama", "list"], capture_output=True, text=True, timeout=10).stdout
-        if any(line.split()[:1] == [LOCAL_PREFERRED] for line in out.splitlines()):
-            return LOCAL_PREFERRED
+        have = {line.split()[0] for line in out.splitlines()[1:] if line.split()}
+        for m in (LOCAL_PREFERRED, *LOCAL_FALLBACKS):
+            if m in have:
+                return m
     except Exception:
         pass
     return PROVIDERS["local"]["model"]
@@ -114,12 +119,37 @@ def a_local(base):
     return "127.0.0.1" in base or "localhost" in base
 
 
+def call_native(model, user):
+    """Ollama's own /api/chat: the only way to set think=false and num_ctx per request.
+
+    A GPU-wide shared model must be called with the same num_ctx every tool uses
+    (a different value forces a reload, evicting everyone else's copy)."""
+    body = json.dumps({
+        "model": model, "stream": False, "format": "json", "think": False,
+        "keep_alive": os.environ.get("OLLAMA_KEEP_ALIVE", "30m"),
+        "options": {"temperature": 0.1, "num_ctx": NUM_CTX},
+        "messages": [{"role": "system", "content": SYSTEM}, {"role": "user", "content": user}],
+    }).encode()
+    req = urllib.request.Request(ollama_base() + "/api/chat", data=body,
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=900) as resp:
+        data = json.load(resp)
+    usage = {"prompt_tokens": data.get("prompt_eval_count"), "completion_tokens": data.get("eval_count"),
+             "num_ctx": NUM_CTX}
+    if (usage["prompt_tokens"] or 0) + (usage["completion_tokens"] or 0) >= NUM_CTX - 16:
+        raise RuntimeError(f"context full ({usage['prompt_tokens']}+{usage['completion_tokens']} of {NUM_CTX}): "
+                           "input was truncated or the answer cut off")
+    return data["message"]["content"], usage
+
+
 def call(base, model, key, old, fetched, section, tool, max_chars):
     user = (
         f"TOOL: {tool}\nSECTION: {section}\n\n"
         f"=== CURRENT SECTION ===\n{old}\n\n"
         f"=== FRESHLY FETCHED SOURCE (may be noisy) ===\n{fetched[:max_chars]}\n"
     )
+    if a_local(base) and not model.startswith("gpt-oss"):
+        return call_native(model, user)
     body = json.dumps({
         "model": model,
         "messages": [
