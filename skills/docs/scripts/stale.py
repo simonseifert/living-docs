@@ -168,6 +168,9 @@ def summary(tool_dirs):
         top = ", ".join(f"{t} ({'never fetched' if o >= 10**6 else f'{o}d over'})"
                         for o, t in worst[:5])
         print(f"Most overdue: {top}.")
+    review = sorted((LIB / "_review").glob("*.md")) if (LIB / "_review").exists() else []
+    if review:
+        print(f"{len(review)} proposed change(s) waiting in _review/ (run /docs review).")
     state = LIB / "_state"
     runs = sorted(state.glob("refresh-*.json")) if state.exists() else []
     if runs:

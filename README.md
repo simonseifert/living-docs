@@ -76,9 +76,20 @@ on a free model, and your main agent is never in the loop.
 
 **The nightly refresh** (`refresh_batch.py --max 60 --commit` from a systemd or launchd
 timer, plus a weekly `--all-tools` sweep) picks the moved and stale sections of the tools
-you actually used recently, re-fetches each, asks a local model (`gpt-oss:20b`) whether the
-facts changed, patches only real changes, commits, and sends one summary. `git revert`
-undoes any night. It is built for running unattended against pages it does not trust:
+you actually used recently and re-fetches each. It only auto-applies what it can check
+mechanically: a version read straight from a registry (npm, PyPI, GitHub latest release,
+WordPress), or a local-model (`gpt-oss:20b`) edit that changes only numbers on existing
+lines, with each new number found on the page next to that line's own words. Everything
+else, new bullets or rewritten prose, goes to a `_review/` queue for `/docs review`.
+
+That line was drawn from evidence. The first unattended run let the model apply any patch
+that passed basic guards; a strict review of its 23 patches found 11 with at least one
+wrong fact (an old version number picked off PyPI's release list, a canary tag reported as
+the latest release, shifted changelog dates, invented features). Replayed under the current
+policy, 21 of those 23 would have been handled deterministically or queued. A small model
+is a good checker and a poor writer, so it is only allowed to check.
+
+It is also built for pages it does not trust:
 
 - a section is only marked verified if the fetched page contains that section's own
   distinctive facts (numbers, versions, names), so a bot wall or the wrong page cannot
@@ -112,6 +123,7 @@ incremental, curated briefs ranked above raw dumps) returns the few passages tha
 /docs refresh <tool>        re-fetch only the stale or moved sections
 /docs search <query>        full-text search across all briefs and raw dumps
 /docs absorb                file facts you flagged in your notes into the right brief
+/docs review                verify and apply (or discard) changes the nightly job queued
 /docs --stale | --lint      staleness per section | manifest health
 /docs list                  list all briefs
 /docs import <tool> <path>  adopt an existing hand-written guide as a managed brief

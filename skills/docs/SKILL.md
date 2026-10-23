@@ -30,6 +30,7 @@ No brief for the tool, and the task is real work against it? Build one (`referen
 /docs refresh <tool> --section pricing,changelog | --all
 /docs search <query> [--tool T]  # full-text search, same as `docs-search`
 /docs absorb                     # file facts flagged in the vault into briefs (references/automation.md)
+/docs review                     # work through _review/: changes the nightly job proposed but did not apply
 /docs --stale | --lint           # per-section staleness | manifest health (scripts/stale.py)
 /docs list                       # INDEX.md
 /docs import <tool> <path>       # adopt an existing hand-written guide as a managed brief

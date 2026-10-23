@@ -220,7 +220,7 @@ def selftest():
 
 
 def selftest_patch():
-    """Six checks for suspicious_patch(); returns the number of failures."""
+    """suspicious_patch() and patch-policy checks; returns the number of failures."""
     old = "Starter plan costs $20/mo (2026-07-28). Docs: https://example.io/pricing"
     page = "Pricing page. Starter plan costs $24/mo. " * 20 + "See https://example.io/pricing"
     cases = [
@@ -244,6 +244,44 @@ def selftest_patch():
         good = bool(why) == want_reject
         print(f"{'PASS' if good else 'FAIL'} suspicious_patch: {label}" + (f" ({why})" if why else ""))
         failures += not good
+    # patch policy (registry path + numeric-only auto-apply), incl. the real
+    # 2026-10-23 failure: PyPI's release list contains old numbers like 1.12.0
+    pypi = json.dumps({"info": {"version": "3.37.0"}, "releases": {"1.12.0": [], "3.37.0": []}})
+    policy = [
+        ("registry: single version bumped from info.version",
+         registry_patch("PyPI `openai` (2.44.0) is the cheap signal.",
+                        registry_value("https://pypi.org/pypi/openai/json", pypi))[:1] == ("patched",)),
+        ("registry: bumped text uses the authoritative value",
+         "3.37.0" in (registry_patch("PyPI `openai` (2.44.0).", "3.37.0")[1] or "")),
+        ("registry: two candidate versions -> review, no guess",
+         registry_patch("npm (6.45.0) and PyPI (2.44.0)", "3.37.0")[0] == "review"),
+        ("registry: downgrade -> review",
+         registry_patch("PyPI openai 3.40.0", "3.37.0")[0] == "review"),
+        ("registry: already current -> same",
+         registry_patch("tag n8n@2.44.6 latest", "n8n@2.44.6")[0] == "same"),
+        ("registry: prerelease GitHub tag ignored",
+         registry_value("https://api.github.com/repos/a/b/releases/latest",
+                        json.dumps({"tag_name": "v16.5.0-canary.24", "prerelease": True})) is None),
+        ("numeric-only: price change on same line auto-applies",
+         numeric_only("- Starter $20/mo\n- Pro $50/mo", "- Starter $24/mo\n- Pro $50/mo")),
+        ("numeric-only: added bullet goes to review",
+         not numeric_only("- Starter $20/mo", "- Starter $24/mo\n- New GPT-6 tier")),
+        ("unsourced number rejected",
+         unsourced_number("v1.2.0", "v1.3.0", "page says v1.2.9") == "1.3.0"),
+    ]
+    fc_page = ("## v2.11.0 released 2026-06-24 with monitors. ## v2.10 released 2026-05-15. "
+               "Pricing: Starter plan $24 per month, Pro plan $50 per month.")
+    policy += [
+        ("date shifted without version change -> unsafe (firecrawl case)",
+         bool(numeric_patch_problem("- v2.11.0 (2026-06-24): monitors", "- v2.11.0 (2026-05-15): monitors", fc_page))),
+        ("price change next to its own words -> safe",
+         numeric_patch_problem("- Starter plan $20 per month", "- Starter plan $24 per month", fc_page) == ""),
+        ("number from elsewhere on the page -> unsafe",
+         bool(numeric_patch_problem("- Enterprise seats: 10", "- Enterprise seats: 50", fc_page))),
+    ]
+    for label, ok in policy:
+        print(f"{'PASS' if ok else 'FAIL'} policy: {label}")
+        failures += not ok
     return failures
 
 
@@ -719,6 +757,135 @@ def unload_model():
 
 # ---------------------------------------------------------------- per section
 
+# ---------------------------------------------------------------- patch policy
+#
+# Unattended edits are only applied when they are small and checkable:
+#  - registry sources (npm, PyPI, GitHub latest release, WordPress plugin API)
+#    never go through the model: the authoritative version field is read and
+#    swapped in deterministically, and only when the section names exactly one
+#    version of that shape (no guessing between several, no downgrades);
+#  - a model patch is applied only if it changes numbers/versions/dates on
+#    existing lines and every new value appears in the fetched page.
+# Everything else (new bullets, rewritten prose) goes to <lib>/_review/ for a
+# human or `/docs review`. On 2026-10-23 the first unattended run wrote
+# "openai PyPI 1.12.0" (live: 3.37.0) by picking an old number off PyPI's
+# release list; this policy exists because of that.
+
+REVIEW_DIR = LIB / "_review"
+VERSION_RE = re.compile(r"(?<![\w.])v?\d+\.\d+(?:\.\d+)?(?:-[0-9A-Za-z.]+)?(?![\w])")
+NUMTOK_RE = re.compile(r"\d[\d.,:/-]*\d|\d")
+
+
+def registry_value(url, fetched):
+    """Authoritative current version for registry URLs, else None."""
+    u = url.lower()
+    try:
+        j = json.loads(fetched)
+    except Exception:
+        return None
+    try:
+        if "pypi.org/pypi/" in u:
+            return str(j["info"]["version"])
+        if "registry.npmjs.org" in u:
+            return str(j.get("version") or j["dist-tags"]["latest"])
+        if "api.github.com" in u and u.rstrip("/").endswith("/releases/latest"):
+            return None if j.get("prerelease") else str(j["tag_name"])
+        if "api.wordpress.org/plugins/info" in u:
+            return str(j["version"])
+    except Exception:
+        return None
+    return None
+
+
+def _vtuple(v):
+    return tuple(int(x) for x in re.findall(r"\d+", v)[:3])
+
+
+def registry_patch(old, value):
+    """("same"|"patched"|"review", new_text_or_None, note)."""
+    bare = value.split("@")[-1].lstrip("vV")
+    if not re.fullmatch(r"\d+(\.\d+){1,2}", bare):
+        return "review", None, f"registry value {value!r} is not a plain release version"
+    if re.search(r"(?<![\d.])" + re.escape(bare) + r"(?![\d])", old):
+        return "same", None, ""
+    shape = bare.count(".")
+    cands = {m.group(0) for m in VERSION_RE.finditer(old)
+             if m.group(0).lstrip("vV").count(".") == shape and "-" not in m.group(0)}
+    if len(cands) != 1:
+        return "review", None, f"registry says {bare}; section names {len(cands)} candidate versions"
+    tok = cands.pop()
+    if _vtuple(tok) >= _vtuple(bare):
+        return "review", None, f"registry {bare} is not newer than {tok} in the brief"
+    repl = ("v" if tok[:1] in "vV" else "") + bare
+    new = re.sub(r"(?<![\d.])" + re.escape(tok) + r"(?![\d])", repl, old)
+    return "patched", new, f"{tok} -> {bare} (registry)"
+
+
+def numeric_only(old, new):
+    """True if new differs from old only in numbers on the same lines."""
+    a, b = old.strip().splitlines(), new.strip().splitlines()
+    if len(a) != len(b):
+        return False
+    return all(x == y or NUMTOK_RE.sub("#", x) == NUMTOK_RE.sub("#", y) for x, y in zip(a, b))
+
+
+def unsourced_number(old, new, fetched):
+    """First number the patch introduces that the fetched page does not contain."""
+    for t in sorted(set(NUMTOK_RE.findall(new)) - set(NUMTOK_RE.findall(old))):
+        if t not in fetched:
+            return t
+    return None
+
+
+DATE_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b|\b\d{1,2} (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]* \d{4}\b"
+                     r"|\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]* \d{1,2},? \d{4}\b")
+WORD_RE = re.compile(r"[A-Za-z][A-Za-z_-]{3,}")
+
+
+def numeric_patch_problem(old, new, fetched):
+    """Why a numbers-only model patch is still unsafe, or ''.
+
+    The 2026-10-23 review found the model swapping a real date or version for
+    a *different* real one from the same page (shifted changelog dates, a
+    release date moved to another release). So per changed line:
+      - dates may change only when a version on that line changes too (past
+        release dates do not move);
+      - every new number must sit on the page within ~300 chars of at least
+        two of the line's own words, not merely somewhere on the page.
+    """
+    low = fetched.lower()
+    for a, b in zip(old.strip().splitlines(), new.strip().splitlines()):
+        if a == b:
+            continue
+        if DATE_RE.findall(a) != DATE_RE.findall(b) and \
+                [m.group(0) for m in VERSION_RE.finditer(a)] == [m.group(0) for m in VERSION_RE.finditer(b)]:
+            return f"changes a date without a version change: {b.strip()[:80]}"
+        words = sorted({w.lower() for w in WORD_RE.findall(b)}, key=len, reverse=True)[:6]
+        for tok in set(NUMTOK_RE.findall(b)) - set(NUMTOK_RE.findall(a)):
+            near = False
+            for m in re.finditer(re.escape(tok), fetched):
+                window = low[max(0, m.start() - 300):m.end() + 300]
+                if sum(1 for w in words if w in window) >= 2:
+                    near = True
+                    break
+            if not near:
+                return f"{tok} is on the page but not next to this line's context"
+    return ""
+
+
+def queue_for_review(sec, old, new, note, dry):
+    if dry:
+        return
+    REVIEW_DIR.mkdir(exist_ok=True)
+    p = REVIEW_DIR / f"{sec['tool']}--{sec['name']}.md"
+    body = (f"# Proposed patch: {sec['tool']} / {sec['name']}\n\n"
+            f"- date: {_today()}\n- source: {sec['url']}\n- why queued: {note}\n\n"
+            "Verify against the source, then apply to brief.md (and restamp sources.yaml) "
+            "or discard. Delete this file when done.\n\n"
+            f"## Current\n\n{old.strip()}\n\n## Proposed\n\n{(new or '(none, see note)').strip()}\n")
+    p.write_text(body)
+
+
 def process(sec, dry):
     """Return a result dict with outcome in: same, patched, fetch-failed, ... ."""
     tool, name = sec["tool"], sec["name"]
@@ -743,6 +910,25 @@ def process(sec, dry):
         res["outcome"] = "fetch-failed"
         return res
     old = body_of(text, h)
+    rv = registry_value(sec["url"], fetched)
+    if rv is not None:
+        kind, new, note = registry_patch(old, rv)
+        res["model_ok"] = True        # counts as checked; no model needed
+        res["summary"] = note
+        if kind == "same":
+            res["outcome"] = "same"
+            res["restamp"] = True
+        elif kind == "patched":
+            res["outcome"] = "patched"
+            res["restamp"] = True
+            if not dry:
+                brief.write_text(apply_patch(text, h, new))
+        else:
+            res["outcome"] = "queued"
+            queue_for_review(sec, old, None, note, dry)
+        if res.get("restamp") and not dry:
+            restamp(LIB / tool / "sources.yaml", name, _today())
+        return res
     try:
         verdict = call_model(tool, name, old, fetched)
     except Exception as e:
@@ -770,6 +956,20 @@ def process(sec, dry):
             res["outcome"] = "rejected-patch"
             res["summary"] = why
             return res
+        if not numeric_only(old, new):
+            res["outcome"] = "queued"
+            queue_for_review(sec, old, new, "adds or rewrites text: " + res["summary"], dry)
+            return res
+        missing = unsourced_number(old, new, fetched)
+        if missing:
+            res["outcome"] = "rejected-patch"
+            res["summary"] = f"patch introduces {missing}, not on the fetched page"
+            return res
+        problem = numeric_patch_problem(old, new, fetched)
+        if problem:
+            res["outcome"] = "queued"
+            queue_for_review(sec, old, new, problem, dry)
+            return res
         res["outcome"] = "patched"
         res["restamp"] = True
         if not dry:
@@ -790,6 +990,8 @@ def describe(r):
         return f"{r['section']} changed: {r['summary']}"
     if o == "same":
         return f"{r['section']} verified, no change"
+    if o == "queued":
+        return f"{r['section']} change proposed, queued in _review/ ({r['summary'][:80]})"
     if o == "fetch-failed":
         return f"{r['section']} unverified (fetch failed)"
     return f"{r['section']} unverified ({o})"
@@ -958,6 +1160,9 @@ def main(argv):
 
     body = "\n".join(f"{r['tool']}/{r['section']}: {r['outcome']} {r['summary']}".rstrip()
                      for r in results) or "nothing selected"
+    queued = sum(1 for r in results if r["outcome"] == "queued")
+    if queued:
+        body += f"\n{queued} proposed patch(es) waiting in _review/: run /docs review"
     for t, (old, hits) in sorted(leftovers.items()):
         body += f"\n{t}: brief still says {old} on {len(hits)} line(s), fix by hand"
     if stopped:
