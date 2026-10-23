@@ -115,6 +115,18 @@ Inside a big brief or a 12 MB help-center mirror, agents search instead of loadi
 `docs-search "webhook retry" --tool n8n` (SQLite FTS5 over every brief and raw dump,
 incremental, curated briefs ranked above raw dumps) returns the few passages that matter.
 
+## Measuring it
+
+`scripts/eval.py` scores the library against your own ground-truth questions
+(`<library>/_eval/questions.yaml`: question, tool, a live-verified answer, and 1-3
+distinctive strings a correct passage must contain). Per question it checks two things,
+with no model and in seconds: does search surface a passage with the right answer, and
+does the brief hold the true current fact at all. Ground truth goes stale too, so
+questions past `--max-age` days are flagged for re-verification. The nightly refresh
+appends the score to its summary. On the author's library the first run scored 12 of 15;
+all three misses were "latest version / current price" facts that had drifted, which is
+exactly what the refresh exists for.
+
 ## Commands
 
 ```

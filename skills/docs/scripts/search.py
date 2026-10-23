@@ -237,6 +237,13 @@ def main():
             return
     try:
         hits = search(con, a.query, a.tool, a.limit, a.briefs_only, a.raw, a.full)
+        if not hits and not a.raw:
+            # all-words found nothing (agents often add a word the brief never uses, like
+            # "difference"): retry with any word, still ranked by bm25, same scope
+            words = [w for w in re.findall(r"[\w.-]+", a.query) if len(w) > 2]
+            if len(words) > 1:
+                anyq = " OR ".join('"' + w.replace('"', '""') + '"' for w in words)
+                hits = search(con, anyq, a.tool, a.limit, a.briefs_only, True, a.full)
     except sqlite3.OperationalError as e:
         sys.exit(f"query error: {e} (try without --raw)")
     if a.json:

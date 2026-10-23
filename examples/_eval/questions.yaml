@@ -1,0 +1,19 @@
+# Example ground-truth set for scripts/eval.py. In your own library, verify every
+# answer against the live source and set `verified` to that date; eval.py flags
+# questions older than --max-age days as due, because ground truth goes stale too.
+- id: apify-rate-limit
+  tool: apify
+  kind: limit
+  question: "What is the default Apify API rate limit per resource?"
+  expect_any: ["60 req/s"]
+  answer: "60 requests per second per resource; Run-Actor endpoints allow 400 req/s."
+  source: https://docs.apify.com/api/v2
+  verified: 2026-07-02
+- id: apify-429
+  tool: apify
+  kind: gotcha
+  question: "What does an Apify API 429 response mean and what should a client do?"
+  expect_any: ["X-RateLimit"]
+  answer: "Rate limit hit: back off exponentially; responses carry X-RateLimit-* headers."
+  source: https://docs.apify.com/api/v2
+  verified: 2026-07-02

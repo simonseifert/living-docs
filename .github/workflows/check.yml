@@ -27,6 +27,7 @@ jobs:
           python skills/docs/scripts/search.py "rate limit" --limit 2
           python skills/docs/scripts/describe.py --check
           python skills/docs/scripts/inbox.py --dry-run
+          python skills/docs/scripts/eval.py --max-age 100000
       - name: skill frontmatter fits the listing cap
         run: |
           python - <<'PY'

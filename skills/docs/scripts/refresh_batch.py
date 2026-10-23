@@ -1167,6 +1167,11 @@ def main(argv):
         body += f"\n{t}: brief still says {old} on {len(hits)} line(s), fix by hand"
     if stopped:
         body += "\n" + stopped
+    if (LIB / "_eval" / "questions.yaml").exists():
+        ev = subprocess.run([sys.executable, str(SCRIPTS / "eval.py"), "--summary"],
+                            capture_output=True, text=True, timeout=300).stdout.strip()
+        if ev:
+            body += "\n" + ev
     print(f"checked {checked}, changed {changed}" + (" (dry run)" if a.dry_run else ""))
     if results and not a.no_ntfy and not a.dry_run:
         notify(f"docs: auto-refresh {checked} checked, {changed} changed", body)
